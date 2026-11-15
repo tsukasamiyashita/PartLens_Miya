@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 PartLens_Miya-v1.0.0
-2D図面 (PDF / CAD DXF) から部品表 (BOM) を作成・編集し Excel (.xlsx) へ出力するデスクトップアプリケーション
+Gemini API マルチモーダル解析 & ローカルエンジン搭載
+2D図面 (PDF / CAD DXF) から部品表 (BOM) を作成・編集し Excel (.xlsx) へ出力するデスクトップアプリ
 Windows 11 ライトモード完全固定対応
 """
 
 import os
+import io
 import sys
 import re
 import csv
@@ -13,10 +15,15 @@ import json
 import math
 import copy
 import uuid
+import base64
 import ctypes
 import tempfile
 import datetime
+import threading
 import traceback
+import urllib.request
+import urllib.error
+import urllib.parse
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Tuple, Optional, Any
 
@@ -31,82 +38,69 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.drawing.image import Image as OpenpyxlImage
 
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    HAS_GOOGLE_GENAI = True
+except Exception:
+    HAS_GOOGLE_GENAI = False
+
 
 # ==============================================================================
-# アプリケーション基本定数・カラーパレット（ライトモード完全固定）
+# 定数・ライトモード固定パレット・Windows API設定
 # ==============================================================================
 
 APP_NAME = "PartLens_Miya-v1.0.0"
-APP_TITLE = "PartLens_Miya-v1.0.0 - 2D図面(PDF/CAD) 部品表(BOM)作成システム"
-APP_VERSION = "1.0.0"
+APP_TITLE = "PartLens_Miya-v1.0.0 - AI搭載 2D図面(PDF/CAD) 部品表(BOM)作成システム"
+CONFIG_FILE_PATH = os.path.join(os.path.expanduser("~"), ".partlens_miya_config.json")
 
 
 class LightPalette:
-    """システムがダークモードであっても常にライトモードで描画するためのカラー定義"""
-    BG_MAIN = "#F1F5F9"         # 全体背景（明るいスレートグレー）
-    BG_PANEL = "#FFFFFF"        # パネル・カード背景（純白）
-    BG_SUB = "#F8FAFC"          # サブパネル・ツールバー背景
-    BG_HEADER = "#1E3A8A"       # ヘッダーバー背景（ディープロイヤルブルー）
-    BG_CANVAS = "#E2E8F0"       # プレビューキャンバス背景
-    BG_ROW_EVEN = "#FFFFFF"     # テーブル偶数行
-    BG_ROW_ODD = "#F8FAFC"      # テーブル奇数行
-    BG_SELECTED = "#DBEAFE"     # 選択行背景（ライトブルー）
-
-    FG_MAIN = "#0F172A"         # メイン文字色（濃紺ブラック）
-    FG_SUB = "#475569"          # サブ文字色（スレートグレー）
-    FG_MUTED = "#64748B"        # 補足文字色
-    FG_HEADER = "#FFFFFF"       # ヘッダー文字色（白）
-    FG_ACCENT = "#1D4ED8"       # アクセント文字色
-
-    BTN_PRIMARY_BG = "#2563EB"  # プライマリボタン背景
-    BTN_PRIMARY_ACTIVE = "#1D4ED8"
+    BG_MAIN = "#F1F5F9"
+    BG_PANEL = "#FFFFFF"
+    BG_SUB = "#F8FAFC"
+    BG_HEADER = "#1E3A8A"
+    BG_CANVAS = "#E2E8F0"
+    BG_ROW_EVEN = "#FFFFFF"
+    BG_ROW_ODD = "#F8FAFC"
+    BG_SELECTED = "#DBEAFE"
+    FG_MAIN = "#0F172A"
+    FG_SUB = "#475569"
+    FG_MUTED = "#64748B"
+    FG_HEADER = "#FFFFFF"
+    FG_ACCENT = "#1D4ED8"
+    BTN_PRIMARY_BG = "#2563EB"
     BTN_PRIMARY_FG = "#FFFFFF"
-
-    BTN_SUCCESS_BG = "#059669"  # Excel出力ボタン等のグリーン
-    BTN_SUCCESS_ACTIVE = "#047857"
+    BTN_AI_BG = "#7C3AED"
+    BTN_AI_FG = "#FFFFFF"
+    BTN_SUCCESS_BG = "#059669"
     BTN_SUCCESS_FG = "#FFFFFF"
-
-    BTN_WARN_BG = "#D97706"     # 範囲選択などのアクセントオレンジ
-    BTN_WARN_ACTIVE = "#B45309"
+    BTN_WARN_BG = "#D97706"
     BTN_WARN_FG = "#FFFFFF"
-
-    BTN_DEFAULT_BG = "#FFFFFF"  # 標準ボタン背景
-    BTN_DEFAULT_ACTIVE = "#E2E8F0"
+    BTN_DEFAULT_BG = "#FFFFFF"
     BTN_DEFAULT_FG = "#1E293B"
-
-    BORDER = "#CBD5E1"          # 境界線色
-    BORDER_FOCUS = "#3B82F6"    # フォーカス枠色
-    HIGHLIGHT_BOX = "#F59E0B"   # 図面ハイライト枠色（アンバー）
-    SELECT_BOX = "#EF4444"      # マウス範囲選択枠色（レッド）
+    BORDER = "#CBD5E1"
+    HIGHLIGHT_BOX = "#F59E0B"
+    SELECT_BOX = "#EF4444"
 
 
 def get_resource_path(relative_path: str) -> str:
-    """PyInstallerバンドル時(_MEIPASS)および通常実行時のリソースパスを解決する"""
     base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base_path, relative_path)
 
 
 def enforce_windows_light_mode(window: tk.Misc) -> None:
-    """Windows 11/10 のシステム設定に関わらずウィンドウをライトモードに固定する"""
     if sys.platform == "win32":
         try:
-            hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
-            if not hwnd:
-                hwnd = window.winfo_id()
-            # DWMWA_USE_IMMERSIVE_DARK_MODE = 20 -> 0 (FALSE: ライトモード強制)
-            value = ctypes.c_int(0)
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, 20, ctypes.byref(value), ctypes.sizeof(value)
-            )
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, 19, ctypes.byref(value), ctypes.sizeof(value)
-            )
+            hwnd = ctypes.windll.user32.GetParent(window.winfo_id()) or window.winfo_id()
+            val = ctypes.c_int(0)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(val), ctypes.sizeof(val))
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 19, ctypes.byref(val), ctypes.sizeof(val))
         except Exception:
             pass
 
 
 def enable_high_dpi_awareness() -> None:
-    """Windows 11 高DPI環境での文字ぼやけを防止する"""
     if sys.platform == "win32":
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -118,113 +112,364 @@ def enable_high_dpi_awareness() -> None:
 
 
 # ==============================================================================
-# JIS規格材質辞書・表面処理・標準部品マスターデータ
+# JIS規格材質マスター・表面処理・標準部品辞書
 # ==============================================================================
 
 MATERIAL_MASTER: Dict[str, Dict[str, Any]] = {
-    "SS400": {"category": "一般構造用圧延鋼材", "density": 7.85, "default_treat": "四三酸化鉄皮膜"},
-    "S45C": {"category": "機械構造用炭素鋼", "density": 7.85, "default_treat": "四三酸化鉄皮膜"},
-    "S50C": {"category": "機械構造用炭素鋼", "density": 7.85, "default_treat": "四三酸化鉄皮膜"},
-    "S35C": {"category": "機械構造用炭素鋼", "density": 7.85, "default_treat": "四三酸化鉄皮膜"},
-    "SCM435": {"category": "クロムモリブデン鋼", "density": 7.85, "default_treat": "調質・四三酸化鉄皮膜"},
-    "SCM440": {"category": "クロムモリブデン鋼", "density": 7.85, "default_treat": "調質・四三酸化鉄皮膜"},
-    "SCM415": {"category": "クロムモリブデン鋼", "density": 7.85, "default_treat": "浸炭焼入れ研磨"},
-    "SKD11": {"category": "合金工具鋼", "density": 7.85, "default_treat": "焼入れ焼戻し(HRC58-60)"},
-    "SKH51": {"category": "高速度工具鋼(ハイス)", "density": 8.15, "default_treat": "焼入れ焼戻し"},
-    "SK85": {"category": "炭素工具鋼(旧SK5)", "density": 7.85, "default_treat": "焼入れ"},
-    "SPCC": {"category": "冷間圧延鋼板", "density": 7.85, "default_treat": "ユニクロめっき"},
-    "SPHC": {"category": "熱間圧延軟鋼板", "density": 7.85, "default_treat": "塗装"},
-    "SECC": {"category": "電気亜鉛めっき鋼板", "density": 7.85, "default_treat": "生地"},
-    "SGP": {"category": "配管用炭素鋼鋼管", "density": 7.85, "default_treat": "塗装"},
-    "STKM13A": {"category": "機械構造用炭素鋼鋼管", "density": 7.85, "default_treat": "四三酸化鉄皮膜"},
-    "STKR400": {"category": "一般構造用角形鋼管", "density": 7.85, "default_treat": "塗装"},
-    "FC200": {"category": "ねずみ鋳鉄", "density": 7.20, "default_treat": "塗装"},
-    "FC250": {"category": "ねずみ鋳鉄", "density": 7.25, "default_treat": "塗装"},
-    "FCD450": {"category": "球状黒鉛鋳鉄", "density": 7.10, "default_treat": "塗装"},
-    "SUS304": {"category": "オーステナイト系ステンレス", "density": 7.93, "default_treat": "生地(酸洗)"},
-    "SUS303": {"category": "快削ステンレス", "density": 7.93, "default_treat": "生地"},
-    "SUS316": {"category": "耐食ステンレス", "density": 7.98, "default_treat": "生地"},
-    "SUS316L": {"category": "極低炭素ステンレス", "density": 7.98, "default_treat": "生地"},
-    "SUS430": {"category": "フェライト系ステンレス", "density": 7.70, "default_treat": "生地"},
-    "SUS440C": {"category": "マルテンサイト系ステンレス", "density": 7.75, "default_treat": "焼入れ"},
-    "SUS630": {"category": "析出硬化系ステンレス", "density": 7.78, "default_treat": "H900熱処理"},
-    "A5052": {"category": "アルミニウム合金", "density": 2.68, "default_treat": "白アルマイト"},
-    "A5056": {"category": "アルミニウム合金(丸棒等)", "density": 2.64, "default_treat": "白アルマイト"},
-    "A6061": {"category": "構造用アルミニウム合金", "density": 2.70, "default_treat": "白アルマイト"},
-    "A6063": {"category": "押出用アルミニウム合金", "density": 2.70, "default_treat": "アルマイト"},
-    "A2017": {"category": "ジュラルミン", "density": 2.79, "default_treat": "白アルマイト"},
-    "A7075": {"category": "超々ジュラルミン", "density": 2.80, "default_treat": "硬質アルマイト"},
-    "ADC12": {"category": "アルミダイカスト", "density": 2.70, "default_treat": "生地"},
-    "C3604": {"category": "快削黄銅(真鍮)", "density": 8.50, "default_treat": "生地"},
-    "C2801": {"category": "黄銅板", "density": 8.40, "default_treat": "生地"},
-    "C1100": {"category": "タフピッチ銅", "density": 8.89, "default_treat": "生地"},
-    "C1020": {"category": "無酸素銅", "density": 8.94, "default_treat": "生地"},
-    "CAC406": {"category": "青銅鋳物(BC6)", "density": 8.80, "default_treat": "生地"},
-    "POM": {"category": "ポリアセタール(ジュラコン)", "density": 1.41, "default_treat": "生地"},
-    "MCナイロン": {"category": "モノマーキャストナイロン", "density": 1.16, "default_treat": "生地"},
-    "66ナイロン": {"category": "ポリアミド樹脂", "density": 1.14, "default_treat": "生地"},
-    "PEEK": {"category": "ポリエーテルエーテルケトン", "density": 1.30, "default_treat": "生地"},
-    "PTFE": {"category": "四フッ化エチレン(テフロン)", "density": 2.16, "default_treat": "生地"},
-    "UHMW-PE": {"category": "超高分子量ポリエチレン", "density": 0.94, "default_treat": "生地"},
-    "PC": {"category": "ポリカーボネート", "density": 1.20, "default_treat": "透明"},
-    "ABS": {"category": "ABS樹脂", "density": 1.05, "default_treat": "生地"},
-    "PMMA": {"category": "アクリル樹脂", "density": 1.19, "default_treat": "透明"},
-    "PVC": {"category": "硬質塩化ビニル", "density": 1.40, "default_treat": "生地"},
-    "ウレタン": {"category": "ポリウレタン(PU)", "density": 1.20, "default_treat": "生地"},
-    "NBR": {"category": "ニトリルゴム", "density": 1.20, "default_treat": "生地"},
-    "CRゴム": {"category": "クロロプレンゴム", "density": 1.25, "default_treat": "生地"},
-    "シリコンゴム": {"category": "シリコーンゴム", "density": 1.18, "default_treat": "生地"},
+    "SS400": {"density": 7.85, "treat": "四三酸化鉄皮膜"},
+    "S45C": {"density": 7.85, "treat": "四三酸化鉄皮膜"},
+    "S50C": {"density": 7.85, "treat": "四三酸化鉄皮膜"},
+    "SCM435": {"density": 7.85, "treat": "調質・四三酸化鉄皮膜"},
+    "SCM440": {"density": 7.85, "treat": "調質・四三酸化鉄皮膜"},
+    "SKD11": {"density": 7.85, "treat": "焼入れ焼戻し"},
+    "SKH51": {"density": 8.15, "treat": "焼入れ焼戻し"},
+    "SPCC": {"density": 7.85, "treat": "ユニクロめっき"},
+    "SPHC": {"density": 7.85, "treat": "塗装"},
+    "SECC": {"density": 7.85, "treat": "生地"},
+    "SGP": {"density": 7.85, "treat": "塗装"},
+    "STKM13A": {"density": 7.85, "treat": "四三酸化鉄皮膜"},
+    "STKR400": {"density": 7.85, "treat": "塗装"},
+    "FC200": {"density": 7.20, "treat": "塗装"},
+    "FCD450": {"density": 7.10, "treat": "塗装"},
+    "SUJ2": {"density": 7.83, "treat": "焼入れ研磨"},
+    "SUS304": {"density": 7.93, "treat": "生地(酸洗)"},
+    "SUS303": {"density": 7.93, "treat": "生地"},
+    "SUS316": {"density": 7.98, "treat": "生地"},
+    "SUS430": {"density": 7.70, "treat": "生地"},
+    "SUS440C": {"density": 7.75, "treat": "焼入れ"},
+    "A5052": {"density": 2.68, "treat": "白アルマイト"},
+    "A5056": {"density": 2.64, "treat": "白アルマイト"},
+    "A6061": {"density": 2.70, "treat": "白アルマイト"},
+    "A6063": {"density": 2.70, "treat": "アルマイト"},
+    "A2017": {"density": 2.79, "treat": "白アルマイト"},
+    "A7075": {"density": 2.80, "treat": "硬質アルマイト"},
+    "ADC12": {"density": 2.70, "treat": "生地"},
+    "C3604": {"density": 8.50, "treat": "生地"},
+    "C2801": {"density": 8.40, "treat": "生地"},
+    "C1100": {"density": 8.89, "treat": "生地"},
+    "CAC406": {"density": 8.80, "treat": "生地"},
+    "POM": {"density": 1.41, "treat": "生地"},
+    "MCナイロン": {"density": 1.16, "treat": "生地"},
+    "PEEK": {"density": 1.30, "treat": "生地"},
+    "PTFE": {"density": 2.16, "treat": "生地"},
+    "UHMW-PE": {"density": 0.94, "treat": "生地"},
+    "PC": {"density": 1.20, "treat": "透明"},
+    "ABS": {"density": 1.05, "treat": "生地"},
+    "PMMA": {"density": 1.19, "treat": "透明"},
+    "PVC": {"density": 1.40, "treat": "生地"},
+    "ウレタン": {"density": 1.20, "treat": "生地"},
+    "NBR": {"density": 1.20, "treat": "生地"},
 }
 
 SURFACE_TREATMENTS: List[str] = [
-    "生地",
-    "四三酸化鉄皮膜(黒染め)",
-    "無電解ニッケルめっき",
-    "硬質クロムめっき",
-    "三価クロメートめっき",
-    "ユニクロめっき",
-    "溶融亜鉛めっき",
-    "白アルマイト",
-    "黒アルマイト",
-    "硬質アルマイト",
-    "焼入れ研磨",
-    "高周波焼入れ",
-    "浸炭焼入れ",
-    "窒化処理",
-    "調質(QT)",
-    "メラミン焼付塗装",
-    "粉体塗装",
-    "ウレタン塗装",
-    "錆止め塗装",
-    "酸洗・不動態化処理",
-    "電解研磨",
-    "バフ研磨",
+    "生地", "四三酸化鉄皮膜(黒染め)", "無電解ニッケルめっき", "硬質クロムめっき",
+    "三価クロメートめっき", "ユニクロめっき", "白アルマイト", "黒アルマイト",
+    "硬質アルマイト", "焼入れ研磨", "高周波焼入れ", "浸炭焼入れ", "調質(QT)",
+    "メラミン焼付塗装", "粉体塗装", "ウレタン塗装", "酸洗・不動態化処理", "電解研磨",
 ]
 
-CATEGORIES: List[str] = [
-    "加工品",
-    "購入品",
-    "標準部品",
-    "製缶・溶接品",
-    "板金品",
-    "支給品",
-    "組立品",
-]
-
+CATEGORIES: List[str] = ["加工品", "購入品", "標準部品", "製缶・溶接品", "板金品", "支給品", "組立品"]
 UNITS: List[str] = ["個", "本", "枚", "式", "セット", "組", "m", "kg"]
 
 STANDARD_PART_KEYWORDS: List[str] = [
-    "ボルト", "六角穴付", "キャップボルト", "ナット", "ワッシャ", "座金", "ねじ", "ビス",
-    "ピン", "平行ピン", "ノックピン", "割ピン", "スプリングピン",
-    "平行キー", "止め輪", "C形止め輪", "Eリング",
-    "ベアリング", "軸受", "玉軸受", "カムフォロア", "ピローブロック", "ベアリングホルダ",
-    "リニアガイド", "ボールねじ", "リニアブッシュ", "シャフトホルダ",
-    "Oリング", "オイルシール", "パッキン", "ガスケット",
-    "シリンダ", "エアシリンダ", "モータ", "ステッピングモータ", "サーボモータ", "減速機",
-    "タイミングベルト", "プーリ", "スプロケット", "チェーン", "歯車", "ギヤ", "カップリング",
-    "センサ", "フォトセンサ", "近接スイッチ", "スイッチ", "ケーブルベア",
-    "キャスター", "アジャスタ", "取っ手", "ハンドル", "ヒンジ", "蝶番", "マグネット",
+    "ボルト", "キャップボルト", "ナット", "ワッシャ", "座金", "ねじ", "ピン", "平行キー",
+    "止め輪", "ベアリング", "軸受", "カムフォロア", "リニアガイド", "ボールねじ", "リニアブッシュ",
+    "Oリング", "オイルシール", "シリンダ", "モータ", "減速機", "ベルト", "プーリ", "スプロケット",
+    "チェーン", "ギヤ", "カップリング", "センサ", "スイッチ", "キャスター", "アジャスタ",
 ]
+
+# 2026年11月時点 Gemini API 公式モデル体系に基づく最適モデル・カタログ定義
+DEFAULT_OPTIMAL_GEMINI_MODEL: str = "gemini-3.8-flash"
+
+DEPRECATED_GEMINI_MODEL_REPLACEMENTS: Dict[str, str] = {
+    "gemini-2.0-flash": "gemini-3.8-flash",
+    "gemini-2.0-flash-lite": "gemini-3.5-flash-lite",
+    "gemini-2.0-pro-exp": "gemini-3.8-flash",
+    "gemini-2.5-pro": "gemini-3.8-flash",
+    "gemini-3.7-flash": "gemini-3.8-flash",
+}
+
+GEMINI_MODEL_CATALOG: List[Dict[str, Any]] = [
+    {
+        "id": "gemini-3.8-flash",
+        "display_name": "Gemini 3.8 Flash",
+        "generation": "Gemini 3.8",
+        "tier_badge": "★図面解析 最推奨",
+        "free_tier": "無料枠あり",
+        "speed": "高速",
+        "accuracy": "非常に高い",
+        "pricing": "無料枠 / 低単価 ($0.75~$1.50)",
+        "supports_media_resolution": True,
+        "is_gemini4": False,
+        "recommended_rank": 1,
+        "recommended": True,
+        "source": "標準カタログ",
+        "description": (
+            "2D図面・部品表(BOM)解析における総合最適モデル。高解像度画像読取(MEDIA_RESOLUTION_HIGH)と"
+            "位置座標(box_2d)・JSON構造化出力に優れ、細かな寸法値や表題欄の読み取り精度と応答速度・コストを高い次元で両立します。"
+        ),
+    },
+    {
+        "id": "gemini-4-hydrogen",
+        "display_name": "Gemini 4 Hydrogen",
+        "generation": "Gemini 4",
+        "tier_badge": "Gemini 4 標準・推奨",
+        "free_tier": "無料枠あり",
+        "speed": "高速",
+        "accuracy": "非常に高い",
+        "pricing": "無料枠 / 標準 ($1.50/$7.50)",
+        "supports_media_resolution": True,
+        "is_gemini4": True,
+        "recommended_rank": 2,
+        "recommended": True,
+        "source": "標準カタログ",
+        "description": (
+            "最新Gemini 4世代の汎用バランスモデル（無料枠から利用可能）。"
+            "複雑な加工品仕様の解釈、JIS材質正規化、購入品メーカー推論を伴うBOM作成に強みを発揮します。"
+        ),
+    },
+    {
+        "id": "gemini-4-argon",
+        "display_name": "Gemini 4 Argon",
+        "generation": "Gemini 4",
+        "tier_badge": "Gemini 4 高度推論",
+        "free_tier": "有料プラン",
+        "speed": "標準",
+        "accuracy": "最高クラス",
+        "pricing": "有料 ($2.00/$10.00)",
+        "supports_media_resolution": True,
+        "is_gemini4": True,
+        "recommended_rank": 3,
+        "recommended": True,
+        "source": "標準カタログ",
+        "description": (
+            "部品点数が非常に多い大規模組立図や、多数ページの複雑な図面セットの統合推論に適した高効率フロンティアモデル。"
+            "AI Pro / AI Ultra 等の上位APIプラン環境で高い解析精度を発揮します。"
+        ),
+    },
+    {
+        "id": "gemini-4-carbon",
+        "display_name": "Gemini 4 Carbon",
+        "generation": "Gemini 4",
+        "tier_badge": "Gemini 4 最高精度",
+        "free_tier": "有料(Ultra等)",
+        "speed": "じっくり推論",
+        "accuracy": "最高峰",
+        "pricing": "有料 ($2.00~$4.00)",
+        "supports_media_resolution": True,
+        "is_gemini4": True,
+        "recommended_rank": 4,
+        "recommended": False,
+        "source": "標準カタログ",
+        "description": (
+            "Google最上位の深層推論フロンティアモデル。文字が潰れた古いスキャン紙図面や手書き注記が多い難読図面を"
+            "徹底精査したい場合に最適です（対応有料プランが必要です）。"
+        ),
+    },
+    {
+        "id": "gemini-3.6-flash",
+        "display_name": "Gemini 3.6 Flash",
+        "generation": "Gemini 3.6",
+        "tier_badge": "安定版 (GA)",
+        "free_tier": "無料枠/有料",
+        "speed": "高速",
+        "accuracy": "高い",
+        "pricing": "低単価 ($0.75/$3.75)",
+        "supports_media_resolution": True,
+        "is_gemini4": False,
+        "recommended_rank": 5,
+        "recommended": False,
+        "source": "標準カタログ",
+        "description": (
+            "一般提供(GA)済みの安定版Flashモデル。提供終了予定のない安定した運用環境や、"
+            "旧Gemini 2.0系からの確実な置き換え先として安心してお使いいただけます。"
+        ),
+    },
+    {
+        "id": "gemini-3.5-flash-lite",
+        "display_name": "Gemini 3.5 Flash-Lite",
+        "generation": "Gemini 3.5",
+        "tier_badge": "超高速・省コスト (GA)",
+        "free_tier": "無料枠/最安",
+        "speed": "超高速",
+        "accuracy": "標準〜高い",
+        "pricing": "最安帯 ($0.30/$2.50)",
+        "supports_media_resolution": True,
+        "is_gemini4": False,
+        "recommended_rank": 6,
+        "recommended": False,
+        "source": "標準カタログ",
+        "description": (
+            "超高速・低コストの軽量GAモデル。数十枚の図面フォルダを一括高速スキャンする場合や、"
+            "文字がはっきりした単品図の連続処理で待機時間とAPIコストを抑えたい場合に最適です。"
+        ),
+    },
+    {
+        "id": "gemini-3.1-pro-preview",
+        "display_name": "Gemini 3.1 Pro (Preview)",
+        "generation": "Gemini 3.1",
+        "tier_badge": "Pro プレビュー",
+        "free_tier": "有料/制限",
+        "speed": "標準",
+        "accuracy": "非常に高い",
+        "pricing": "Pro料金帯",
+        "supports_media_resolution": True,
+        "is_gemini4": False,
+        "recommended_rank": 7,
+        "recommended": False,
+        "source": "標準カタログ",
+        "description": (
+            "Gemini 3.1世代のPro系プレビューモデル。図面内の長文注記や部品関連性の精査・比較検証向けです。"
+        ),
+    },
+    {
+        "id": "gemini-2.5-flash",
+        "display_name": "Gemini 2.5 Flash (旧世代)",
+        "generation": "Gemini 2.5",
+        "tier_badge": "旧世代・互換用",
+        "free_tier": "制限あり",
+        "speed": "高速",
+        "accuracy": "標準",
+        "pricing": "旧世代料金",
+        "supports_media_resolution": False,
+        "is_gemini4": False,
+        "recommended_rank": 80,
+        "recommended": False,
+        "source": "標準カタログ",
+        "description": (
+            "旧2.5世代の互換維持用モデル（段階的移行対象）。新規利用ではより高精度・最新対応の "
+            "gemini-3.8-flash または gemini-4-hydrogen の利用を推奨します。"
+        ),
+    },
+]
+
+GEMINI_MODELS: List[str] = [m["id"] for m in GEMINI_MODEL_CATALOG]
+
+
+def strip_gemini_model_prefix(model_id: str) -> str:
+    raw = str(model_id or "").strip()
+    if raw.startswith("models/"):
+        raw = raw[len("models/"):]
+    return raw.strip()
+
+
+def migrate_deprecated_model_id(model_id: str) -> str:
+    clean = strip_gemini_model_prefix(model_id)
+    if not clean:
+        return DEFAULT_OPTIMAL_GEMINI_MODEL
+    if clean in DEPRECATED_GEMINI_MODEL_REPLACEMENTS:
+        return DEPRECATED_GEMINI_MODEL_REPLACEMENTS[clean]
+    return clean
+
+
+def get_gemini_model_catalog_map() -> Dict[str, Dict[str, Any]]:
+    return {m["id"]: copy.deepcopy(m) for m in GEMINI_MODEL_CATALOG}
+
+
+def get_gemini_model_entry(
+    model_id: str,
+    catalog_entries: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    clean = strip_gemini_model_prefix(model_id)
+    source_list = catalog_entries if catalog_entries else GEMINI_MODEL_CATALOG
+    for m in source_list:
+        if m.get("id") == clean:
+            return copy.deepcopy(m)
+    for m in GEMINI_MODEL_CATALOG:
+        if m.get("id") == clean:
+            return copy.deepcopy(m)
+    is_g4 = clean.startswith("gemini-4")
+    supports_mr = is_g4 or clean.startswith("gemini-3")
+    return {
+        "id": clean or DEFAULT_OPTIMAL_GEMINI_MODEL,
+        "display_name": clean or DEFAULT_OPTIMAL_GEMINI_MODEL,
+        "generation": "Gemini 4" if is_g4 else ("Gemini 3" if clean.startswith("gemini-3") else "カスタム/API"),
+        "tier_badge": "カスタムモデル" if clean else "★図面解析 最推奨",
+        "free_tier": "契約プラン依存",
+        "speed": "APIモデル参照",
+        "accuracy": "APIモデル参照",
+        "pricing": "Google AI料金表準拠",
+        "supports_media_resolution": supports_mr,
+        "is_gemini4": is_g4,
+        "recommended_rank": 50,
+        "recommended": False,
+        "source": "手動指定/API",
+        "description": "ユーザーが指定したモデルID、またはAPI一覧から取得したモデルです。",
+    }
+
+
+def select_optimal_gemini_model(
+    models: Optional[List[Dict[str, Any]]] = None,
+    priority: str = "balanced",
+) -> str:
+    """
+    利用可能なモデル一覧（未指定時は標準カタログ）から、
+    2D図面・部品表(BOM)解析に最適なモデルIDを優先方針に応じて自動選定する。
+    priority:
+      - "balanced": 精度・速度・コスト総合最適 (図面解析 標準推奨)
+      - "accuracy": 難読・複雑図面向け 最高精度優先
+      - "speed":    大量一括解析向け 高速・省コスト優先
+    """
+    pool = models if models else GEMINI_MODEL_CATALOG
+    available_ids = {strip_gemini_model_prefix(m.get("id", "")) for m in pool if m.get("id")}
+    if not available_ids:
+        return DEFAULT_OPTIMAL_GEMINI_MODEL
+
+    priority_orders: Dict[str, List[str]] = {
+        "balanced": [
+            "gemini-3.8-flash",
+            "gemini-4-hydrogen",
+            "gemini-3.6-flash",
+            "gemini-4-argon",
+            "gemini-3.5-flash-lite",
+            "gemini-4-carbon",
+            "gemini-3.1-pro-preview",
+            "gemini-2.5-flash",
+        ],
+        "accuracy": [
+            "gemini-4-carbon",
+            "gemini-4-argon",
+            "gemini-4-hydrogen",
+            "gemini-3.8-flash",
+            "gemini-3.1-pro-preview",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash-lite",
+        ],
+        "speed": [
+            "gemini-3.5-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-3.6-flash",
+            "gemini-4-hydrogen",
+            "gemini-4-argon",
+            "gemini-2.5-flash",
+        ],
+    }
+    order = priority_orders.get(priority, priority_orders["balanced"])
+    for cand in order:
+        if cand in available_ids:
+            return cand
+
+    # 未知の最新世代モデル（例: gemini-4.* / gemini-3.*）のみが存在する場合はランク順で先頭を返す
+    sorted_pool = sorted(
+        [m for m in pool if m.get("id")],
+        key=lambda x: (int(x.get("recommended_rank", 99)), str(x.get("id", ""))),
+    )
+    return strip_gemini_model_prefix(sorted_pool[0]["id"]) if sorted_pool else DEFAULT_OPTIMAL_GEMINI_MODEL
+
+
+def format_model_choice_label(entry: Dict[str, Any]) -> str:
+    mid = strip_gemini_model_prefix(str(entry.get("id", "")))
+    badge = str(entry.get("tier_badge", "")).strip()
+    return f"{mid}  [{badge}]" if badge else mid
+
+
+def extract_model_id_from_choice(text: str) -> str:
+    raw = str(text or "").strip()
+    if "  [" in raw:
+        raw = raw.split("  [", 1)[0].strip()
+    elif " |" in raw:
+        raw = raw.split(" |", 1)[0].strip()
+    return strip_gemini_model_prefix(raw)
 
 
 # ==============================================================================
@@ -233,7 +478,6 @@ STANDARD_PART_KEYWORDS: List[str] = [
 
 @dataclass
 class PartItem:
-    """部品表(BOM)の1行を表すデータクラス"""
     uid: str = field(default_factory=lambda: str(uuid.uuid4()))
     item_no: str = "1"
     part_number: str = ""
@@ -261,46 +505,70 @@ class PartItem:
         return round(self.quantity * self.unit_price, 2)
 
     def formatted_qty(self) -> str:
-        if float(self.quantity).is_integer():
-            return str(int(self.quantity))
-        return f"{self.quantity:.2f}".rstrip("0").rstrip(".")
+        return str(int(self.quantity)) if float(self.quantity).is_integer() else f"{self.quantity:.2f}".rstrip("0").rstrip(".")
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         d["bbox"] = list(self.bbox)
         return d
 
+    @staticmethod
+    def _safe_float(val: Any, default: float = 0.0) -> float:
+        if isinstance(val, (int, float)):
+            return float(val)
+        s = str(val or "").replace(",", "").strip()
+        m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
+        if m:
+            try:
+                return float(m.group(0))
+            except Exception:
+                pass
+        return default
+
+    @staticmethod
+    def _safe_int(val: Any, default: int = 1) -> int:
+        if isinstance(val, int):
+            return val
+        s = str(val or "").strip()
+        m = re.search(r"\d+", s)
+        if m:
+            try:
+                return int(m.group(0))
+            except Exception:
+                pass
+        return default
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PartItem":
-        bbox_val = data.get("bbox", [0.0, 0.0, 0.0, 0.0])
-        if isinstance(bbox_val, (list, tuple)) and len(bbox_val) == 4:
-            bbox_tuple = (float(bbox_val[0]), float(bbox_val[1]), float(bbox_val[2]), float(bbox_val[3]))
-        else:
-            bbox_tuple = (0.0, 0.0, 0.0, 0.0)
+        b = data.get("bbox", [0.0, 0.0, 0.0, 0.0])
+        bbox_t = (
+            (cls._safe_float(b[0]), cls._safe_float(b[1]), cls._safe_float(b[2]), cls._safe_float(b[3]))
+            if isinstance(b, (list, tuple)) and len(b) == 4
+            else (0.0, 0.0, 0.0, 0.0)
+        )
         return cls(
-            uid=str(data.get("uid", str(uuid.uuid4()))),
-            item_no=str(data.get("item_no", "1")),
-            part_number=str(data.get("part_number", "")),
-            part_name=str(data.get("part_name", "")),
-            specification=str(data.get("specification", "")),
-            material=str(data.get("material", "")),
-            treatment=str(data.get("treatment", "")),
-            quantity=float(data.get("quantity", 1.0)),
-            unit=str(data.get("unit", "個")),
-            unit_weight=float(data.get("unit_weight", 0.0)),
-            category=str(data.get("category", "加工品")),
-            manufacturer=str(data.get("manufacturer", "")),
-            unit_price=float(data.get("unit_price", 0.0)),
-            source_file=str(data.get("source_file", "")),
-            source_page=int(data.get("source_page", 1)),
-            remarks=str(data.get("remarks", "")),
-            bbox=bbox_tuple,
+            uid=str(data.get("uid", str(uuid.uuid4())) or str(uuid.uuid4())),
+            item_no=str(data.get("item_no", "1") or "1"),
+            part_number=str(data.get("part_number", "") or ""),
+            part_name=str(data.get("part_name", "") or ""),
+            specification=str(data.get("specification", "") or ""),
+            material=str(data.get("material", "") or ""),
+            treatment=str(data.get("treatment", "") or ""),
+            quantity=max(cls._safe_float(data.get("quantity", 1.0), 1.0), 0.0),
+            unit=str(data.get("unit", "個") or "個"),
+            unit_weight=max(cls._safe_float(data.get("unit_weight", 0.0), 0.0), 0.0),
+            category=str(data.get("category", "加工品") or "加工品"),
+            manufacturer=str(data.get("manufacturer", "") or ""),
+            unit_price=max(cls._safe_float(data.get("unit_price", 0.0), 0.0), 0.0),
+            source_file=str(data.get("source_file", "") or ""),
+            source_page=max(cls._safe_int(data.get("source_page", 1), 1), 1),
+            remarks=str(data.get("remarks", "") or ""),
+            bbox=bbox_t,
         )
 
 
 @dataclass
 class TextToken:
-    """図面内の位置座標付きテキスト要素"""
     text: str
     x0: float
     y0: float
@@ -319,71 +587,114 @@ class TextToken:
 
 @dataclass
 class DrawingPageData:
-    """図面の1ページ（または1レイアウト）の解析データとプレビュー画像"""
     page_no: int
     width: float
     height: float
     preview_image: Optional[Image.Image] = None
     tokens: List[TextToken] = field(default_factory=list)
-    raw_tables: List[List[List[str]]] = field(default_factory=list)
     title_meta: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
 class DrawingDocument:
-    """読み込まれた1つの図面ファイル(PDF/DXF)"""
     file_path: str
     file_name: str
-    file_type: str  # "PDF" or "DXF"
+    file_type: str
     pages: List[DrawingPageData] = field(default_factory=list)
     extracted_count: int = 0
     drawing_title: str = ""
     drawing_number: str = ""
 
 
+@dataclass
+class GeminiConfig:
+    api_key: str = ""
+    model_name: str = DEFAULT_OPTIMAL_GEMINI_MODEL
+    auto_use_on_load: bool = True
+    use_for_area_select: bool = True
+    replace_existing_on_ai: bool = True
+    custom_instruction: str = ""
+    save_api_key: bool = True
+    cached_models: List[Dict[str, Any]] = field(default_factory=list)
+
+    def load(self) -> None:
+        # 1. 環境変数 / .env の確認
+        env_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        if not env_key and os.path.exists(".env"):
+            try:
+                with open(".env", "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.strip().startswith("GEMINI_API_KEY="):
+                            env_key = line.strip().split("=", 1)[1].strip().strip("\"'")
+            except Exception:
+                pass
+        if env_key:
+            self.api_key = env_key
+
+        # 2. 設定ファイルの読み込み
+        if os.path.exists(CONFIG_FILE_PATH):
+            try:
+                with open(CONFIG_FILE_PATH, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                if d.get("api_key"):
+                    self.api_key = str(d["api_key"])
+                raw_model = str(d.get("model_name", self.model_name))
+                self.model_name = migrate_deprecated_model_id(raw_model)
+                self.auto_use_on_load = bool(d.get("auto_use_on_load", True))
+                self.use_for_area_select = bool(d.get("use_for_area_select", True))
+                self.replace_existing_on_ai = bool(d.get("replace_existing_on_ai", True))
+                self.custom_instruction = str(d.get("custom_instruction", ""))
+                self.save_api_key = bool(d.get("save_api_key", True))
+                raw_cache = d.get("cached_models", [])
+                if isinstance(raw_cache, list):
+                    self.cached_models = [m for m in raw_cache if isinstance(m, dict) and m.get("id")]
+            except Exception:
+                pass
+
+    def save(self) -> None:
+        try:
+            self.model_name = strip_gemini_model_prefix(self.model_name) or DEFAULT_OPTIMAL_GEMINI_MODEL
+            data = {
+                "api_key": self.api_key if self.save_api_key else "",
+                "model_name": self.model_name,
+                "auto_use_on_load": self.auto_use_on_load,
+                "use_for_area_select": self.use_for_area_select,
+                "replace_existing_on_ai": self.replace_existing_on_ai,
+                "custom_instruction": self.custom_instruction,
+                "save_api_key": self.save_api_key,
+                "cached_models": self.cached_models[:40],
+            }
+            with open(CONFIG_FILE_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+
 # ==============================================================================
-# 重量計算・スマート部品テキスト解析エンジン
+# 重量計算・スマート部品ルール解析エンジン
 # ==============================================================================
 
 class SmartPartAnalyzer:
-    """図面テキストから品番・品名・寸法・材質・表面処理・数量・単重を高精度に判定するエンジン"""
-
     @staticmethod
     def normalize_text(text: str) -> str:
         if not text:
             return ""
-        # 全角英数字・記号の一部を半角に統一
         zen = "０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ－（）×φΦ"
         han = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-()xφφ"
-        trans = str.maketrans(zen, han)
-        cleaned = text.translate(trans)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        return cleaned
+        cleaned = text.translate(str.maketrans(zen, han))
+        return re.sub(r"\s+", " ", cleaned).strip()
 
     @classmethod
     def detect_material(cls, text: str) -> Tuple[str, str]:
-        """文字列から材質と残りの文字列を抽出する"""
         norm = cls.normalize_text(text)
         upper = norm.upper()
-        # 長いキー名から優先マッチング (SUS316L -> SUS316 等)
-        sorted_keys = sorted(MATERIAL_MASTER.keys(), key=len, reverse=True)
-        for mat_key in sorted_keys:
-            pattern = re.compile(re.escape(mat_key), re.IGNORECASE)
-            if pattern.search(upper):
+        for mat_key in sorted(MATERIAL_MASTER.keys(), key=len, reverse=True):
+            if re.search(re.escape(mat_key), upper, re.IGNORECASE):
                 return mat_key, norm
-        # よくある別名表記
         alias_map = {
-            "ジュラコン": "POM",
-            "ポリアセタール": "POM",
-            "テフロン": "PTFE",
-            "アクリル": "PMMA",
-            "塩ビ": "PVC",
-            "真鍮": "C3604",
-            "黄銅": "C3604",
-            "黒皮": "SS400",
-            "ミガキ": "S45C",
-            "ステンレス": "SUS304",
-            "アルミ": "A5052",
+            "ジュラコン": "POM", "ポリアセタール": "POM", "テフロン": "PTFE",
+            "アクリル": "PMMA", "塩ビ": "PVC", "真鍮": "C3604", "黄銅": "C3604",
+            "黒皮": "SS400", "ミガキ": "S45C", "ステンレス": "SUS304", "アルミ": "A5052",
         }
         for alias, mat_key in alias_map.items():
             if alias in norm:
@@ -392,41 +703,25 @@ class SmartPartAnalyzer:
 
     @classmethod
     def detect_treatment(cls, text: str) -> str:
-        """文字列から表面処理・熱処理を検出する"""
         norm = cls.normalize_text(text)
-        treat_keywords = [
-            ("四三酸化鉄皮膜", "四三酸化鉄皮膜(黒染め)"),
-            ("黒染め", "四三酸化鉄皮膜(黒染め)"),
-            ("黒染", "四三酸化鉄皮膜(黒染め)"),
-            ("無電解ニッケル", "無電解ニッケルめっき"),
-            ("カニゼン", "無電解ニッケルめっき"),
-            ("硬質クロム", "硬質クロムめっき"),
-            ("三価クロメート", "三価クロメートめっき"),
-            ("ユニクロ", "ユニクロめっき"),
-            ("硬質アルマイト", "硬質アルマイト"),
-            ("黒アルマイト", "黒アルマイト"),
-            ("白アルマイト", "白アルマイト"),
-            ("アルマイト", "白アルマイト"),
-            ("高周波焼入", "高周波焼入れ"),
-            ("浸炭焼入", "浸炭焼入れ"),
-            ("焼入研磨", "焼入れ研磨"),
-            ("焼入れ", "焼入れ研磨"),
-            ("窒化", "窒化処理"),
-            ("メラミン塗装", "メラミン焼付塗装"),
-            ("粉体塗装", "粉体塗装"),
-            ("塗装", "ウレタン塗装"),
-            ("酸洗", "酸洗・不動態化処理"),
-            ("電解研磨", "電解研磨"),
-            ("バフ", "バフ研磨"),
+        rules = [
+            ("四三酸化鉄皮膜", "四三酸化鉄皮膜(黒染め)"), ("黒染", "四三酸化鉄皮膜(黒染め)"),
+            ("無電解ニッケル", "無電解ニッケルめっき"), ("カニゼン", "無電解ニッケルめっき"),
+            ("硬質クロム", "硬質クロムめっき"), ("三価クロメート", "三価クロメートめっき"),
+            ("ユニクロ", "ユニクロめっき"), ("硬質アルマイト", "硬質アルマイト"),
+            ("黒アルマイト", "黒アルマイト"), ("白アルマイト", "白アルマイト"),
+            ("アルマイト", "白アルマイト"), ("高周波焼入", "高周波焼入れ"),
+            ("浸炭焼入", "浸炭焼入れ"), ("焼入", "焼入れ研磨"),
+            ("メラミン", "メラミン焼付塗装"), ("粉体塗装", "粉体塗装"),
+            ("塗装", "ウレタン塗装"), ("酸洗", "酸洗・不動態化処理"), ("電解研磨", "電解研磨"),
         ]
-        for kw, canonical in treat_keywords:
+        for kw, canonical in rules:
             if kw in norm:
                 return canonical
         return ""
 
     @classmethod
     def detect_category(cls, part_name: str, spec: str, material: str, manufacturer: str) -> str:
-        """部品名や仕様・メーカーから調達区分（加工品 / 標準部品 / 購入品 / 板金品 / 製缶・溶接品）を自動推定"""
         combined = f"{part_name} {spec} {manufacturer}".upper()
         for kw in STANDARD_PART_KEYWORDS:
             if kw.upper() in combined:
@@ -437,112 +732,105 @@ class SmartPartAnalyzer:
             return "標準部品"
         if manufacturer.strip():
             return "購入品"
-        if any(w in combined for w in ["溶接", "フレーム", "架台", "ベースフレーム", "製缶"]):
+        if any(w in combined for w in ["溶接", "フレーム", "架台", "製缶"]):
             return "製缶・溶接品"
-        if any(w in combined for w in ["カバー", "ブラケット", "ステー", "パネル", "シャーシ"]) and material in ("SPCC", "SECC", "SUS304", "A5052"):
+        if any(w in combined for w in ["カバー", "ブラケット", "ステー", "パネル"]) and material in ("SPCC", "SECC", "SUS304", "A5052"):
             if re.search(r"\bt\s*[0-5](\.\d+)?\b", combined, re.IGNORECASE):
                 return "板金品"
         return "加工品"
 
     @classmethod
     def estimate_weight_from_spec(cls, spec: str, material: str) -> float:
-        """
-        寸法文字列（例: t10x100x200, 100x50x12, φ30x150, φ50xt3x200 等）と材質比重から単重(kg)を自動推算する
-        1 cm3 = 1000 mm3, 単重(kg) = 体積(mm3) * 比重(g/cm3) / 1,000,000
-        """
         if not spec:
             return 0.0
         norm = cls.normalize_text(spec)
-        density = 7.85  # デフォルト鉄比重
+        density = 7.85
         if material in MATERIAL_MASTER:
             density = float(MATERIAL_MASTER[material]["density"])
         else:
-            detected_mat, _ = cls.detect_material(material)
-            if detected_mat in MATERIAL_MASTER:
-                density = float(MATERIAL_MASTER[detected_mat]["density"])
+            mat, _ = cls.detect_material(material)
+            if mat in MATERIAL_MASTER:
+                density = float(MATERIAL_MASTER[mat]["density"])
 
-        # パターン1: 丸パイプ φD x tT x L (例: φ50xt3x200, φ60.5x3.2x500)
-        m_pipe = re.search(
-            r"[φD]\s*(\d+(?:\.\d+)?)\s*[xX]\s*t?\s*(\d+(?:\.\d+)?)\s*[xX]\s*[L]?\s*(\d+(?:\.\d+)?)",
-            norm, re.IGNORECASE
+        # 1. 角パイプ (A x B x tT x L または □A x B x t x L)
+        m_sq_pipe = re.search(
+            r"(?:□|角)?\s*(\d+(?:\.\d+)?)\s*[xX]\s*(\d+(?:\.\d+)?)\s*[xX]\s*t?\s*(\d+(?:\.\d+)?)\s*[xX]\s*[L]?\s*(\d+(?:\.\d+)?)",
+            norm,
+            re.IGNORECASE,
         )
+        if m_sq_pipe:
+            a_out = float(m_sq_pipe.group(1))
+            b_out = float(m_sq_pipe.group(2))
+            t_w = float(m_sq_pipe.group(3))
+            length = float(m_sq_pipe.group(4))
+            if a_out > t_w * 2.0 and b_out > t_w * 2.0 and t_w <= 40.0:
+                in_a = max(a_out - 2.0 * t_w, 0.0)
+                in_b = max(b_out - 2.0 * t_w, 0.0)
+                vol = (a_out * b_out - in_a * in_b) * length
+                return round(vol * density / 1_000_000.0, 3)
+
+        # 2. 丸パイプ φD x tT x L
+        m_pipe = re.search(r"[φD]\s*(\d+(?:\.\d+)?)\s*[xX]\s*t?\s*(\d+(?:\.\d+)?)\s*[xX]\s*[L]?\s*(\d+(?:\.\d+)?)", norm, re.IGNORECASE)
         if m_pipe:
-            d_out = float(m_pipe.group(1))
-            t_wall = float(m_pipe.group(2))
-            length = float(m_pipe.group(3))
-            if d_out > t_wall * 2.0 and t_wall < 30.0:
-                r_out = d_out * 0.5
-                r_in = r_out - t_wall
-                vol_mm3 = math.pi * (r_out * r_out - r_in * r_in) * length
-                return round(vol_mm3 * density / 1_000_000.0, 3)
+            d_out, t_w, length = float(m_pipe.group(1)), float(m_pipe.group(2)), float(m_pipe.group(3))
+            if d_out > t_w * 2.0 and t_w < 30.0:
+                r_o, r_i = d_out * 0.5, d_out * 0.5 - t_w
+                return round(math.pi * (r_o * r_o - r_i * r_i) * length * density / 1_000_000.0, 3)
 
-        # パターン2: 直方体・プレート (例: t12x100x250, 100x200xt10, 50x80x150)
-        m_plate = re.search(
-            r"[tT]?\s*(\d+(?:\.\d+)?)\s*[xX]\s*[tT]?\s*(\d+(?:\.\d+)?)\s*[xX]\s*[tT]?\s*[L]?\s*(\d+(?:\.\d+)?)",
-            norm
-        )
+        # 3. 六角棒 HEX H x L / 六角 H x L
+        m_hex = re.search(r"(?:HEX|六角|対辺)\s*(\d+(?:\.\d+)?)\s*[xX\-]\s*[L]?\s*(\d+(?:\.\d+)?)", norm, re.IGNORECASE)
+        if m_hex:
+            h_flat, length = float(m_hex.group(1)), float(m_hex.group(2))
+            vol = (math.sqrt(3.0) * 0.5) * (h_flat * h_flat) * length
+            return round(vol * density / 1_000_000.0, 3)
+
+        # 4. プレート t x W x L
+        m_plate = re.search(r"[tT]?\s*(\d+(?:\.\d+)?)\s*[xX]\s*[tT]?\s*(\d+(?:\.\d+)?)\s*[xX]\s*[tT]?\s*[L]?\s*(\d+(?:\.\d+)?)", norm)
         if m_plate:
-            a = float(m_plate.group(1))
-            b = float(m_plate.group(2))
-            c = float(m_plate.group(3))
-            vol_mm3 = a * b * c
-            return round(vol_mm3 * density / 1_000_000.0, 3)
+            vol = float(m_plate.group(1)) * float(m_plate.group(2)) * float(m_plate.group(3))
+            return round(vol * density / 1_000_000.0, 3)
 
-        # パターン3: 丸棒・円柱 φD x L (例: φ30x150, φ25xL80, D20x100)
-        m_cyl = re.search(
-            r"[φD]\s*(\d+(?:\.\d+)?)\s*[xX\-]\s*[L]?\s*(\d+(?:\.\d+)?)",
-            norm, re.IGNORECASE
-        )
+        # 5. 丸棒 φD x L
+        m_cyl = re.search(r"[φD]\s*(\d+(?:\.\d+)?)\s*[xX\-]\s*[L]?\s*(\d+(?:\.\d+)?)", norm, re.IGNORECASE)
         if m_cyl:
-            d_val = float(m_cyl.group(1))
-            length = float(m_cyl.group(2))
-            radius = d_val * 0.5
-            vol_mm3 = math.pi * (radius * radius) * length
-            return round(vol_mm3 * density / 1_000_000.0, 3)
+            r = float(m_cyl.group(1)) * 0.5
+            return round(math.pi * (r * r) * float(m_cyl.group(2)) * density / 1_000_000.0, 3)
 
-        # パターン4: 六角ボルト M径x長さ の概算重量
+        # 6. ボルト M径 x 長さ
         m_bolt = re.search(r"\bM(\d+(?:\.\d+)?)\s*[xX]\s*(\d+(?:\.\d+)?)", norm, re.IGNORECASE)
         if m_bolt:
-            d_val = float(m_bolt.group(1))
-            length = float(m_bolt.group(2))
-            radius = d_val * 0.5
-            # 軸部＋頭部（軸径の約1.2倍径×0.7倍高）の概算
-            vol_mm3 = math.pi * (radius * radius) * (length + d_val * 1.1)
-            return round(vol_mm3 * density / 1_000_000.0, 4)
+            d, length = float(m_bolt.group(1)), float(m_bolt.group(2))
+            r = d * 0.5
+            return round(math.pi * (r * r) * (length + d * 1.1) * density / 1_000_000.0, 4)
 
         return 0.0
 
     @classmethod
     def classify_table_headers(cls, header_cells: List[str]) -> Dict[int, str]:
-        """テーブルヘッダー行の各列がどのフィールドに対応するかを判定する"""
         col_map: Dict[int, str] = {}
-        header_rules = [
-            ("item_no", ["NO", "NO.", "項番", "番号", "符号", "品番NO", "ITEM", "POS", "SYM"]),
-            ("part_number", ["図番", "部品番号", "品番", "DRAWING", "DWG", "PART NO", "CODE", "部品コード"]),
-            ("part_name", ["品名", "名称", "部品名", "部品名称", "NAME", "DESCRIPTION", "TITLE"]),
-            ("specification", ["型式", "寸法", "仕様", "サイズ", "規格", "材料寸法", "SIZE", "SPEC", "MODEL", "TYPE"]),
+        rules = [
+            ("item_no", ["NO", "NO.", "項番", "番号", "符号", "ITEM", "POS"]),
+            ("part_number", ["図番", "部品番号", "品番", "DRAWING", "DWG", "PART NO", "CODE"]),
+            ("part_name", ["品名", "名称", "部品名", "部品名称", "NAME", "DESCRIPTION"]),
+            ("specification", ["型式", "寸法", "仕様", "サイズ", "規格", "材料寸法", "SIZE", "SPEC", "MODEL"]),
             ("material", ["材質", "材料", "MATERIAL", "MAT"]),
-            ("treatment", ["表面処理", "熱処理", "処理", "塗装", "FINISH", "TREATMENT", "COATING"]),
+            ("treatment", ["表面処理", "熱処理", "処理", "塗装", "FINISH", "TREATMENT"]),
             ("quantity", ["数量", "個数", "員数", "数", "QTY", "Q'TY", "QUANTITY"]),
             ("unit", ["単位", "UNIT"]),
-            ("unit_weight", ["単重", "重量", "質量", "WEIGHT", "MASS", "WT"]),
-            ("manufacturer", ["メーカー", "メーカ", "製造元", "手配先", "仕入先", "MAKER", "VENDOR", "BRAND"]),
-            ("unit_price", ["単価", "価格", "PRICE", "COST"]),
-            ("remarks", ["備考", "記事", "摘要", "注記", "REMARK", "REMARKS", "NOTE", "NOTES"]),
+            ("unit_weight", ["単重", "重量", "質量", "WEIGHT", "MASS"]),
+            ("manufacturer", ["メーカー", "メーカ", "手配先", "仕入先", "MAKER", "VENDOR"]),
+            ("unit_price", ["単価", "価格", "PRICE"]),
+            ("remarks", ["備考", "記事", "摘要", "注記", "REMARK", "REMARKS", "NOTE"]),
         ]
-
         for idx, raw_cell in enumerate(header_cells):
             cell = cls.normalize_text(raw_cell).upper()
             if not cell:
                 continue
-            for field_name, keywords in header_rules:
+            for field_name, keywords in rules:
                 if field_name in col_map.values():
                     continue
-                for kw in keywords:
-                    if kw == cell or (len(kw) >= 2 and kw in cell):
-                        col_map[idx] = field_name
-                        break
-                if idx in col_map:
+                if any(kw == cell or (len(kw) >= 2 and kw in cell) for kw in keywords):
+                    col_map[idx] = field_name
                     break
         return col_map
 
@@ -550,35 +838,22 @@ class SmartPartAnalyzer:
     def parse_unstructured_row(
         cls, cells: List[str], default_idx: int, source_file: str, page_no: int, bbox: Tuple[float, float, float, float]
     ) -> Optional[PartItem]:
-        """ヘッダーが不明な行や範囲選択されたテキスト行からスマートにPartItemを構築する"""
         cleaned = [cls.normalize_text(c) for c in cells if cls.normalize_text(c)]
         if not cleaned:
             return None
-
         joined = " ".join(cleaned)
-        # ヘッダー行そのものや図面枠の定型句は除外
-        ignore_words = ["部品番号", "部品名称", "第三角法", "尺度", "SCALE", "PROJECTION", "設計", "検図", "承認", "作成日"]
-        hit_header = sum(1 for w in ["品名", "材質", "数量", "備考", "図番", "名称"] if w in joined)
-        if hit_header >= 2:
+        if sum(1 for w in ["品名", "材質", "数量", "備考", "図番", "名称"] if w in joined) >= 2:
             return None
-        if any(w == joined for w in ignore_words):
+        if any(w == joined for w in ["部品番号", "部品名称", "第三角法", "尺度", "SCALE", "PROJECTION"]):
             return None
 
-        item = PartItem(
-            item_no=str(default_idx),
-            source_file=source_file,
-            source_page=page_no,
-            bbox=bbox,
-        )
-
+        item = PartItem(item_no=str(default_idx), source_file=source_file, source_page=page_no, bbox=bbox)
         remaining: List[str] = []
+
         for idx, token in enumerate(cleaned):
-            # 1. 先頭セルが純粋な小整数なら項番
             if idx == 0 and re.fullmatch(r"\d{1,3}", token):
                 item.item_no = token
                 continue
-
-            # 2. 材質判定
             mat, _ = cls.detect_material(token)
             if mat and not item.material and len(token) <= 18:
                 item.material = mat
@@ -586,39 +861,26 @@ class SmartPartAnalyzer:
                 if treat and not item.treatment:
                     item.treatment = treat
                 continue
-
-            # 3. 表面処理判定
             treat = cls.detect_treatment(token)
             if treat and not item.treatment and len(token) <= 20:
                 item.treatment = treat
                 continue
-
-            # 4. 数量判定 (例: "2", "4個", "1式", "x4", "QTY:2")
-            m_qty_unit = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(個|本|枚|式|組|セット|m|kg)", token)
-            if m_qty_unit:
-                item.quantity = float(m_qty_unit.group(1))
-                item.unit = m_qty_unit.group(2)
+            m_qu = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(個|本|枚|式|組|セット|m|kg)", token)
+            if m_qu:
+                item.quantity, item.unit = float(m_qu.group(1)), m_qu.group(2)
                 continue
-
             if idx >= 1 and re.fullmatch(r"\d{1,3}", token):
                 val = int(token)
                 if 1 <= val <= 500 and item.quantity == 1.0:
                     item.quantity = float(val)
                     continue
-
-            # 5. 重量表記 (例: "1.25kg", "0.8 kg")
             m_wt = re.fullmatch(r"(\d+(?:\.\d+)?)\s*kg", token, re.IGNORECASE)
             if m_wt:
                 item.unit_weight = float(m_wt.group(1))
                 continue
-
-            # 6. 寸法・仕様表記 (例: t10x100x200, φ30x150, M8x25)
-            if re.search(r"([tT]\d+|\d+\s*[xX×]\s*\d+|[φD]\d+|\bM\d+\s*[xX×]\s*\d+)", token):
-                if not item.specification:
-                    item.specification = token
-                    continue
-
-            # 7. 図番・型番パターン (英字+数字+ハイフン、かつ日本語を含まない)
+            if re.search(r"([tT]\d+|\d+\s*[xX×]\s*\d+|[φD]\d+|\bM\d+\s*[xX×]\s*\d+)", token) and not item.specification:
+                item.specification = token
+                continue
             if not re.search(r"[ぁ-んァ-ン一-龥]", token) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\-_/\.\(\)]{2,24}", token):
                 if not item.part_number:
                     item.part_number = token
@@ -626,55 +888,695 @@ class SmartPartAnalyzer:
                 elif not item.specification:
                     item.specification = token
                     continue
-
             remaining.append(token)
 
-        # 残りのトークンを品名・備考・メーカーへ割り当て
-        for text_piece in remaining:
-            if any(mk in text_piece for mk in ["ミスミ", "MISUMI", "THK", "SMC", "CKD", "NSK", "NTN", "IKO", "オリエンタル", "キーエンス", "オムロン", "鍋屋", "NBK", "イマオ", "椿本"]):
-                if not item.manufacturer:
-                    item.manufacturer = text_piece
-                    continue
-            if not item.part_name:
-                item.part_name = text_piece
+        for tp in remaining:
+            if any(mk in tp for mk in ["ミスミ", "MISUMI", "THK", "SMC", "CKD", "NSK", "NTN", "IKO", "オリエンタル", "キーエンス", "オムロン", "NBK"]) and not item.manufacturer:
+                item.manufacturer = tp
+            elif not item.part_name:
+                item.part_name = tp
             elif not item.specification:
-                item.specification = text_piece
+                item.specification = tp
             elif not item.remarks:
-                item.remarks = text_piece
+                item.remarks = tp
             else:
-                item.remarks = f"{item.remarks} {text_piece}"
+                item.remarks = f"{item.remarks} {tp}"
 
-        # 品名が空で図番や仕様だけある場合の補完
         if not item.part_name and item.part_number:
-            if re.match(r"^M\d+", item.part_number, re.IGNORECASE):
-                item.specification = item.part_number
-                item.part_name = "六角穴付ボルト"
-                item.part_number = ""
-            else:
-                item.part_name = item.part_number
-
+            item.part_name = item.part_number
         if not item.part_name and not item.part_number and not item.specification:
             return None
-
-        # 材質に応じたデフォルト表面処理と重量自動推算
-        if item.material and not item.treatment:
-            if item.material in MATERIAL_MASTER:
-                item.treatment = MATERIAL_MASTER[item.material]["default_treat"]
-
+        if item.material and not item.treatment and item.material in MATERIAL_MASTER:
+            item.treatment = MATERIAL_MASTER[item.material]["treat"]
         if item.unit_weight == 0.0 and item.specification:
             item.unit_weight = cls.estimate_weight_from_spec(item.specification, item.material)
-
         item.category = cls.detect_category(item.part_name, item.specification, item.material, item.manufacturer)
         return item
 
 
 # ==============================================================================
-# 2D図面解析エンジン層 (PDF & CAD DXF)
+# Gemini API マルチモーダル図面解析エンジン
 # ==============================================================================
 
-class DrawingParserEngine:
-    """PDFおよびDXF図面からページプレビュー・テキスト座標・部品リストを抽出するコアエンジン"""
+class GeminiVisionAnalyzer:
+    """
+    Gemini API (google-genai SDK および REST API フォールバック) を用いて
+    2D図面の画像＋ベクターテキストから高精度に部品表(BOM)を構造化抽出するエンジン
+    """
 
+    SYSTEM_PROMPT = """あなたは熟練した機械設計・製造エンジニアであり、2D図面（PDF/CAD組立図・部品図）の解析エキスパートです。
+与えられた2D図面画像および図面内の抽出テキスト情報から、部品表（BOM: Bill of Materials）のすべての部品行と表題欄情報を漏れなく正確に抽出し、指定されたJSONフォーマットのみで出力してください。
+
+【厳守する解析ルール】
+1. 組立図に「部品表（部品欄）」がある場合は、すべての行（下から上に番号が振られている場合も上から下の場合も含む）を1行も漏らさず抽出してください。
+2. 図面内のバルーン（丸数字や引き出し線）や注記に部品情報がある場合はそれも補完してください。
+3. 単品図（1枚の図面に1つの加工部品のみが描かれている図面）で部品表がない場合は、表題欄の「図面名称」「図番」「材質」「処理」「数量」および投影図内の外形寸法（例: 板厚t12, 幅100, 長さ250 -> t12x100x250、丸棒φ30, 長さ150 -> φ30x150）を読み取って1件の部品データとして構築してください。
+4. 材質は可能な限りJIS規格記号（SS400, S45C, SUS304, SUS303, A5052, A6063, SCM435,SKD11, FC200, MCナイロン, POM 等）に正規化してください。
+5. specification（型式・材料寸法）には、加工品なら材料寸法（例: t10x180x550, φ30x420）、購入品や標準部品なら型番・サイズ（例: M8x25, UCFL206, 6005ZZ）を記載してください。
+6. unit_weight（単重 kg）が図面に記載されていればその数値を、記載がなくても寸法と材質から計算可能であれば概算単重(kg)を数値で入れてください。
+7. category（調達区分）は「加工品」「購入品」「標準部品」「板金品」「製缶・溶接品」のいずれかを適切に判定してください。
+8. box_2d には、各部品行（または該当部品）が図面画像内のどこにあるかを 0〜1000 の正規化座標 [ymin, xmin, ymax, xmax]（整数4つ）で出力してください。不明な場合は [0, 0, 0, 0] としてください。
+9. 出力は必ず純粋なJSONオブジェクトのみとし、前後の説明文は一切含めないでください。"""
+
+    EXCLUDED_MODEL_KEYWORDS: Tuple[str, ...] = (
+        "embedding", "aqa", "imagen", "veo", "lyria", "-tts",
+        "native-audio", "live", "robotics", "gemma", "learnlm",
+        "decision", "nano-banana",
+    )
+
+    @classmethod
+    def _is_candidate_drawing_model(cls, model_id: str, supported_methods: List[str]) -> bool:
+        mid = strip_gemini_model_prefix(model_id).lower()
+        if not mid or "gemini" not in mid:
+            return False
+        if mid in DEPRECATED_GEMINI_MODEL_REPLACEMENTS:
+            return False
+        if any(bad in mid for bad in cls.EXCLUDED_MODEL_KEYWORDS):
+            return False
+        if supported_methods:
+            lower_methods = {str(m).lower() for m in supported_methods}
+            if "generatecontent" not in lower_methods:
+                return False
+        return True
+
+    @classmethod
+    def parse_models_api_payload(cls, resp_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        raw_list = resp_json.get("models", [])
+        if not isinstance(raw_list, list):
+            return results
+        for m in raw_list:
+            if not isinstance(m, dict):
+                continue
+            mid = strip_gemini_model_prefix(str(m.get("name", "") or m.get("baseModelId", "")))
+            methods = m.get("supportedGenerationMethods") or m.get("supportedActions") or []
+            methods_list = [str(x) for x in methods] if isinstance(methods, list) else []
+            if not cls._is_candidate_drawing_model(mid, methods_list):
+                continue
+            results.append({
+                "id": mid,
+                "display_name": str(m.get("displayName", "") or mid).strip(),
+                "description": str(m.get("description", "") or "").strip(),
+                "input_token_limit": int(m.get("inputTokenLimit", 0) or 0),
+                "output_token_limit": int(m.get("outputTokenLimit", 0) or 0),
+                "supported_methods": methods_list,
+            })
+        return results
+
+    @staticmethod
+    def _infer_dynamic_rank_and_badge(model_id: str) -> Tuple[int, str, str, str, str]:
+        low = model_id.lower()
+        if "gemini-4" in low:
+            if "carbon" in low:
+                return 10, "Gemini 4 最高精度", "じっくり推論", "最高峰", "Gemini 4"
+            if "argon" in low:
+                return 11, "Gemini 4 高度推論", "標準", "最高クラス", "Gemini 4"
+            if "hydrogen" in low:
+                return 12, "Gemini 4 バランス", "高速", "非常に高い", "Gemini 4"
+            return 14, "Gemini 4 (API最新)", "標準〜高速", "非常に高い", "Gemini 4"
+        if "gemini-3.8" in low or "gemini-3.9" in low:
+            return 15, "Gemini 3.8+ (API)", "高速", "非常に高い", "Gemini 3.8+"
+        if "gemini-3" in low:
+            if "flash-lite" in low:
+                return 25, "Flash-Lite (軽量)", "超高速", "高い", "Gemini 3"
+            if "pro" in low:
+                return 18, "Pro (API)", "標準", "非常に高い", "Gemini 3"
+            return 20, "Flash (API)", "高速", "高い", "Gemini 3"
+        if "flash-latest" in low:
+            return 22, "最新Flashエイリアス", "高速", "高い", "Latest"
+        if "pro-latest" in low:
+            return 24, "最新Proエイリアス", "標準", "非常に高い", "Latest"
+        if "gemini-2.5" in low:
+            return 80, "旧世代 (互換用)", "高速", "標準", "Gemini 2.5"
+        return 60, "API取得モデル", "標準", "標準〜高い", "Gemini API"
+
+    @classmethod
+    def merge_catalog_with_api_models(cls, api_models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        組み込みの最新カタログと API から取得した利用可能モデル一覧を統合し、
+        2D図面・BOM解析に最適な順へソートして返す。
+        """
+        catalog_map = get_gemini_model_catalog_map()
+        merged_by_id: Dict[str, Dict[str, Any]] = {}
+
+        for raw in api_models:
+            mid = strip_gemini_model_prefix(str(raw.get("id", "")))
+            if not mid or mid in DEPRECATED_GEMINI_MODEL_REPLACEMENTS:
+                continue
+            if mid in catalog_map:
+                entry = copy.deepcopy(catalog_map[mid])
+                entry["source"] = "API利用可能"
+                if raw.get("input_token_limit"):
+                    entry["input_token_limit"] = raw["input_token_limit"]
+                if raw.get("output_token_limit"):
+                    entry["output_token_limit"] = raw["output_token_limit"]
+                merged_by_id[mid] = entry
+            else:
+                rank, badge, speed, acc, gen = cls._infer_dynamic_rank_and_badge(mid)
+                api_desc = str(raw.get("description", "") or "").strip()
+                if not api_desc:
+                    api_desc = "Gemini API から動的に取得された生成対応モデルです。"
+                merged_by_id[mid] = {
+                    "id": mid,
+                    "display_name": str(raw.get("display_name", "") or mid),
+                    "generation": gen,
+                    "tier_badge": badge,
+                    "free_tier": "APIキー権限に準拠",
+                    "speed": speed,
+                    "accuracy": acc,
+                    "pricing": "Google AI料金表参照",
+                    "supports_media_resolution": mid.startswith("gemini-3") or mid.startswith("gemini-4") or "latest" in mid,
+                    "is_gemini4": mid.startswith("gemini-4"),
+                    "recommended_rank": rank,
+                    "recommended": rank <= 20,
+                    "source": "API利用可能",
+                    "description": api_desc,
+                    "input_token_limit": int(raw.get("input_token_limit", 0) or 0),
+                    "output_token_limit": int(raw.get("output_token_limit", 0) or 0),
+                }
+
+        # API未収載でも標準カタログの推奨項目を末尾に保持（参考表示用）
+        for cat_entry in GEMINI_MODEL_CATALOG:
+            cid = cat_entry["id"]
+            if cid not in merged_by_id:
+                fallback_entry = copy.deepcopy(cat_entry)
+                fallback_entry["source"] = "カタログ (参考)"
+                fallback_entry["recommended_rank"] = int(cat_entry.get("recommended_rank", 50)) + 100
+                merged_by_id[cid] = fallback_entry
+
+        sorted_entries = sorted(
+            merged_by_id.values(),
+            key=lambda x: (
+                0 if x.get("source") == "API利用可能" else 1,
+                int(x.get("recommended_rank", 99)),
+                str(x.get("id", "")),
+            ),
+        )
+        return sorted_entries
+
+    @classmethod
+    def fetch_available_models(cls, api_key: str) -> List[Dict[str, Any]]:
+        """
+        Gemini API (google-genai SDK または REST API v1beta/models) から
+        現在のAPIキーで利用可能な最新モデル一覧を取得し、最適度順に整理して返す。
+        """
+        clean_key = api_key.strip()
+        if not clean_key:
+            raise ValueError("APIキーが入力されていません。")
+
+        collected: List[Dict[str, Any]] = []
+
+        # 1. google-genai SDK で一覧取得を試行
+        if HAS_GOOGLE_GENAI:
+            try:
+                client = genai.Client(api_key=clean_key)
+                for m in client.models.list():
+                    mid = strip_gemini_model_prefix(getattr(m, "name", "") or getattr(m, "base_model_id", ""))
+                    actions = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", None) or []
+                    actions_list = [str(a) for a in actions] if actions else []
+                    if not cls._is_candidate_drawing_model(mid, actions_list):
+                        continue
+                    collected.append({
+                        "id": mid,
+                        "display_name": str(getattr(m, "display_name", "") or mid).strip(),
+                        "description": str(getattr(m, "description", "") or "").strip(),
+                        "input_token_limit": int(getattr(m, "input_token_limit", 0) or 0),
+                        "output_token_limit": int(getattr(m, "output_token_limit", 0) or 0),
+                        "supported_methods": actions_list,
+                    })
+                if collected:
+                    return cls.merge_catalog_with_api_models(collected)
+            except Exception:
+                collected = []
+
+        # 2. REST API (v1beta/models) でページネーション取得
+        encoded_key = urllib.parse.quote(clean_key, safe="")
+        page_token = ""
+        for _ in range(5):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models?key={encoded_key}&pageSize=100"
+            if page_token:
+                url += f"&pageToken={urllib.parse.quote(page_token, safe='')}"
+            req = urllib.request.Request(url, method="GET")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    resp_json = json.loads(resp.read().decode("utf-8"))
+                collected.extend(cls.parse_models_api_payload(resp_json))
+                page_token = str(resp_json.get("nextPageToken", "") or "").strip()
+                if not page_token:
+                    break
+            except urllib.error.HTTPError as he:
+                detail = ""
+                try:
+                    detail = he.read().decode("utf-8")
+                except Exception:
+                    pass
+                raise RuntimeError(f"モデル一覧の取得に失敗しました (HTTP {he.code}): {detail[:250]}")
+            except Exception as e:
+                raise RuntimeError(f"モデル一覧の取得中に通信エラーが発生しました: {e}")
+
+        if not collected:
+            raise RuntimeError("利用可能な Gemini 生成モデルを取得できませんでした。APIキーの権限をご確認ください。")
+
+        return cls.merge_catalog_with_api_models(collected)
+
+    @classmethod
+    def test_connection(cls, config: GeminiConfig) -> Tuple[bool, str]:
+        if not config.api_key.strip():
+            return False, "APIキーが入力されていません。"
+        prompt = '次のJSONのみを返してください: {"status": "ok", "message": "接続成功"}'
+        try:
+            res_text = cls._call_gemini_api(config, prompt, image=None)
+            if "ok" in res_text.lower() or "接続" in res_text:
+                return True, f"Gemini API ({config.model_name}) への接続に成功しました！"
+            return True, f"応答を受信しました: {res_text[:80]}"
+        except Exception as e:
+            return False, f"接続エラー: {e}"
+
+    @classmethod
+    def analyze_drawing_page(
+        cls,
+        config: GeminiConfig,
+        page_data: DrawingPageData,
+        source_file: str,
+        crop_rect: Optional[Tuple[float, float, float, float]] = None,
+    ) -> Tuple[List[PartItem], Dict[str, str]]:
+        """
+        ページ全体または選択矩形範囲の画像＋テキストトークンをGemini APIへ送信し、
+        抽出された PartItem リストと表題欄メタデータ辞書を返す。
+        """
+        if not config.api_key.strip():
+            raise ValueError("Gemini APIキーが設定されていません。上部の「Gemini AI設定」から設定してください。")
+        if page_data.preview_image is None:
+            raise ValueError("解析対象の図面プレビュー画像が存在しません。")
+
+        img_to_send = page_data.preview_image
+        iw, ih = img_to_send.size
+        offset_x, offset_y = 0.0, 0.0
+        region_w, region_h = page_data.width, page_data.height
+
+        # 範囲選択時はその領域を高解像度クロップして送信
+        if crop_rect is not None:
+            px0, py0, px1, py1 = crop_rect
+            offset_x, offset_y = px0, py0
+            region_w = max(px1 - px0, 1.0)
+            region_h = max(py1 - py0, 1.0)
+            cx0 = int(max(0.0, (px0 / max(page_data.width, 1.0)) * iw))
+            cy0 = int(max(0.0, (py0 / max(page_data.height, 1.0)) * ih))
+            cx1 = int(min(float(iw), (px1 / max(page_data.width, 1.0)) * iw))
+            cy1 = int(min(float(ih), (py1 / max(page_data.height, 1.0)) * ih))
+            if cx1 - cx0 > 10 and cy1 - cy0 > 10:
+                img_to_send = img_to_send.crop((cx0, cy0, cx1, cy1))
+
+        # ベクターテキストトークンの補助コンテキスト化（文字認識のクロスチェック用）
+        relevant_tokens = page_data.tokens
+        if crop_rect is not None:
+            px0, py0, px1, py1 = crop_rect
+            relevant_tokens = [
+                t for t in page_data.tokens
+                if t.cx >= px0 and t.cx <= px1 and t.cy >= py0 and t.cy <= py1
+            ]
+
+        sorted_tokens = sorted(relevant_tokens, key=lambda t: (round(t.cy / 8.0), t.x0))
+        token_lines: List[str] = []
+        for t in sorted_tokens[:350]:
+            rel_x = int(((t.cx - offset_x) / max(region_w, 1.0)) * 1000)
+            rel_y = int(((t.cy - offset_y) / max(region_h, 1.0)) * 1000)
+            token_lines.append(f"[{rel_y},{rel_x}] {t.text}")
+        vector_context = "\n".join(token_lines) if token_lines else "(ベクター文字なし - 画像から直接OCR解析してください)"
+
+        extra_inst = f"\n【ユーザー追加指示】\n{config.custom_instruction}\n" if config.custom_instruction.strip() else ""
+        mode_desc = "選択された矩形範囲（部品欄・注記エリア）" if crop_rect else f"2D図面全体 (ファイル名: {source_file}, ページ: {page_data.page_no})"
+
+        user_prompt = f"""{cls.SYSTEM_PROMPT}
+{extra_inst}
+【解析対象】
+{mode_desc}
+
+【図面ファイルから抽出されたベクター文字と正規化座標 [Y(0-1000), X(0-1000)] ヒント】
+{vector_context}
+
+【出力JSONスキーマ】
+以下のキーを持つJSONオブジェクトを出力してください:
+{{
+  "drawing_title": "図面名称（不明なら空文字）",
+  "drawing_number": "図面番号（不明なら空文字）",
+  "parts": [
+    {{
+      "item_no": "1",
+      "part_number": "図番または型番",
+      "part_name": "品名・部品名称",
+      "specification": "型式・材料寸法・仕様",
+      "material": "材質記号",
+      "treatment": "表面処理・熱処理",
+      "quantity": 1,
+      "unit": "個",
+      "unit_weight": 0.0,
+      "category": "加工品",
+      "manufacturer": "メーカー名",
+      "remarks": "備考",
+      "box_2d": [ymin, xmin, ymax, xmax]
+    }}
+  ]
+}}"""
+
+        raw_json_str = cls._call_gemini_api(config, user_prompt, image=img_to_send)
+        parsed = cls._extract_json_dict(raw_json_str)
+
+        meta = {
+            "drawing_title": str(parsed.get("drawing_title", "") or "").strip(),
+            "drawing_number": str(parsed.get("drawing_number", "") or "").strip(),
+        }
+
+        parts_list: List[PartItem] = []
+        raw_parts = parsed.get("parts", [])
+        if isinstance(raw_parts, list):
+            for idx, rp in enumerate(raw_parts, start=1):
+                if not isinstance(rp, dict):
+                    continue
+                item = cls._dict_to_part_item(
+                    rp, idx, source_file, page_data.page_no, offset_x, offset_y, region_w, region_h
+                )
+                if item:
+                    parts_list.append(item)
+
+        return parts_list, meta
+
+    @classmethod
+    def refine_bom_parts(cls, config: GeminiConfig, current_parts: List[PartItem]) -> List[PartItem]:
+        """既存の部品表リストをGemini APIで一括クレンジング・規格正規化・単重/区分/メーカー推論する"""
+        if not config.api_key.strip():
+            raise ValueError("Gemini APIキーが設定されていません。")
+        if not current_parts:
+            return []
+
+        simplified_input = []
+        for p in current_parts:
+            simplified_input.append({
+                "uid": p.uid,
+                "item_no": p.item_no,
+                "part_number": p.part_number,
+                "part_name": p.part_name,
+                "specification": p.specification,
+                "material": p.material,
+                "treatment": p.treatment,
+                "quantity": p.quantity,
+                "unit": p.unit,
+                "unit_weight": p.unit_weight,
+                "category": p.category,
+                "manufacturer": p.manufacturer,
+                "remarks": p.remarks,
+            })
+
+        prompt = f"""あなたは機械設計・購買管理のエキスパートAIです。
+以下の部品表(BOM)データ配列を精査し、各行のデータをより正確かつ標準的な表記に補正・補完してJSONで返してください。
+
+【補正ルール】
+1. uid は入力と同じ値を必ずそのまま保持してください。
+2. 材質(material)に表記ゆれがあればJIS規格記号（SS400, S45C, SUS304, A5052, SCM435, POM, MCナイロン等）に統一してください。
+3. 表面処理(treatment)が空欄で、一般的な加工部品かつ材質から標準処理が明らかな場合は推奨処理を補完してください。
+4. 型式・寸法(specification)や図番(part_number)に市販品の型番（例: UCFL206, 6005ZZ, CDQ2B32, M8x25等）が含まれる場合、品名(part_name)、メーカー名(manufacturer)、調達区分(category: 購入品/標準部品)を正確に補完してください。
+5. 単重(unit_weight)が 0.0 で、寸法と材質から1個あたりの質量(kg)が計算・推定できる場合は、正確な単重(kg)を計算して数値で設定してください。
+
+【入力部品リストJSON】
+{json.dumps(simplified_input, ensure_ascii=False)}
+
+【出力JSON形式】
+{{"parts": [ ...補正後のオブジェクト配列... ]}}"""
+
+        raw_res = cls._call_gemini_api(config, prompt, image=None)
+        parsed = cls._extract_json_dict(raw_res)
+        refined_list = parsed.get("parts", [])
+        if not isinstance(refined_list, list):
+            return current_parts
+
+        refined_map = {str(r.get("uid", "")): r for r in refined_list if isinstance(r, dict)}
+        updated_parts: List[PartItem] = []
+
+        for orig in current_parts:
+            cp = copy.deepcopy(orig)
+            if cp.uid in refined_map:
+                r = refined_map[cp.uid]
+                cp.part_number = str(r.get("part_number", cp.part_number) or cp.part_number).strip()
+                cp.part_name = str(r.get("part_name", cp.part_name) or cp.part_name).strip()
+                cp.specification = str(r.get("specification", cp.specification) or cp.specification).strip()
+                cp.material = str(r.get("material", cp.material) or cp.material).strip()
+                cp.treatment = str(r.get("treatment", cp.treatment) or cp.treatment).strip()
+                cp.unit = str(r.get("unit", cp.unit) or cp.unit).strip()
+                cp.category = str(r.get("category", cp.category) or cp.category).strip()
+                cp.manufacturer = str(r.get("manufacturer", cp.manufacturer) or cp.manufacturer).strip()
+                cp.remarks = str(r.get("remarks", cp.remarks) or cp.remarks).strip()
+                try:
+                    w = float(r.get("unit_weight", cp.unit_weight) or 0.0)
+                    if w > 0:
+                        cp.unit_weight = round(w, 4)
+                except Exception:
+                    pass
+            if cp.unit_weight == 0.0 and cp.specification:
+                cp.unit_weight = SmartPartAnalyzer.estimate_weight_from_spec(cp.specification, cp.material)
+            updated_parts.append(cp)
+
+        return updated_parts
+
+    @classmethod
+    def _dict_to_part_item(
+        cls,
+        d: Dict[str, Any],
+        default_idx: int,
+        source_file: str,
+        page_no: int,
+        offset_x: float,
+        offset_y: float,
+        region_w: float,
+        region_h: float,
+    ) -> Optional[PartItem]:
+        p_num = str(d.get("part_number", "") or "").strip()
+        p_name = str(d.get("part_name", "") or "").strip()
+        spec = str(d.get("specification", "") or "").strip()
+        if not p_name and not p_num and not spec:
+            return None
+
+        item_no = str(d.get("item_no", default_idx) or default_idx).strip()
+        mat = str(d.get("material", "") or "").strip()
+        treat = str(d.get("treatment", "") or "").strip()
+        unit = str(d.get("unit", "個") or "個").strip()
+        cat = str(d.get("category", "") or "").strip()
+        maker = str(d.get("manufacturer", "") or "").strip()
+        remarks = str(d.get("remarks", "") or "").strip()
+
+        try:
+            qty_raw = str(d.get("quantity", 1) or 1)
+            m_q = re.search(r"\d+(?:\.\d+)?", qty_raw)
+            qty = float(m_q.group(0)) if m_q else 1.0
+        except Exception:
+            qty = 1.0
+
+        try:
+            wt_raw = str(d.get("unit_weight", 0.0) or 0.0)
+            m_w = re.search(r"\d+(?:\.\d+)?", wt_raw)
+            u_weight = float(m_w.group(0)) if m_w else 0.0
+        except Exception:
+            u_weight = 0.0
+
+        # box_2d [ymin, xmin, ymax, xmax] (0-1000) -> ページ実座標へ変換
+        bbox = (0.0, 0.0, 0.0, 0.0)
+        b2d = d.get("box_2d")
+        if isinstance(b2d, (list, tuple)) and len(b2d) == 4:
+            try:
+                ymin, xmin, ymax, xmax = float(b2d[0]), float(b2d[1]), float(b2d[2]), float(b2d[3])
+                if ymax > ymin and xmax > xmin:
+                    bx0 = offset_x + (xmin / 1000.0) * region_w
+                    by0 = offset_y + (ymin / 1000.0) * region_h
+                    bx1 = offset_x + (xmax / 1000.0) * region_w
+                    by1 = offset_y + (ymax / 1000.0) * region_h
+                    bbox = (bx0, by0, bx1, by1)
+            except Exception:
+                pass
+
+        if u_weight == 0.0 and spec:
+            u_weight = SmartPartAnalyzer.estimate_weight_from_spec(spec, mat)
+        if not cat or cat not in CATEGORIES:
+            cat = SmartPartAnalyzer.detect_category(p_name, spec, mat, maker)
+
+        return PartItem(
+            item_no=item_no,
+            part_number=p_num,
+            part_name=p_name or p_num,
+            specification=spec,
+            material=mat,
+            treatment=treat,
+            quantity=max(qty, 0.0),
+            unit=unit,
+            unit_weight=max(u_weight, 0.0),
+            category=cat,
+            manufacturer=maker,
+            source_file=source_file,
+            source_page=page_no,
+            remarks=remarks,
+            bbox=bbox,
+        )
+
+    @staticmethod
+    def _supports_media_resolution(model_name: str) -> bool:
+        low = model_name.lower()
+        return low.startswith("gemini-3") or low.startswith("gemini-4") or "latest" in low
+
+    @staticmethod
+    def _is_gemini4_model(model_name: str) -> bool:
+        return model_name.lower().startswith("gemini-4")
+
+    @classmethod
+    def _call_gemini_api(cls, config: GeminiConfig, prompt: str, image: Optional[Image.Image] = None) -> str:
+        """
+        google-genai SDK が利用可能ならSDK経由で呼び出し、
+        失敗または未導入環境では標準ライブラリ urllib.request による REST API で確実に呼び出す。
+        Gemini 3 / 4 系モデルでは画像送信時に MEDIA_RESOLUTION_HIGH を適用し図面読取精度を高める。
+        """
+        api_key = config.api_key.strip()
+        model_name = strip_gemini_model_prefix(config.model_name.strip()) or DEFAULT_OPTIMAL_GEMINI_MODEL
+        use_mr = (image is not None) and cls._supports_media_resolution(model_name)
+        is_g4 = cls._is_gemini4_model(model_name)
+
+        # 1. google-genai SDK 経由の試行
+        if HAS_GOOGLE_GENAI:
+            for try_mr in ([True, False] if use_mr else [False]):
+                try:
+                    client = genai.Client(api_key=api_key)
+                    contents: List[Any] = []
+                    if image is not None:
+                        contents.append(image)
+                    contents.append(prompt)
+
+                    if try_mr:
+                        mr_enum = getattr(genai_types, "MediaResolution", None)
+                        mr_val = mr_enum.MEDIA_RESOLUTION_HIGH if (mr_enum is not None and hasattr(mr_enum, "MEDIA_RESOLUTION_HIGH")) else "MEDIA_RESOLUTION_HIGH"
+                        if is_g4:
+                            gen_cfg = genai_types.GenerateContentConfig(
+                                response_mime_type="application/json",
+                                media_resolution=mr_val,
+                            )
+                        else:
+                            gen_cfg = genai_types.GenerateContentConfig(
+                                temperature=0.1,
+                                response_mime_type="application/json",
+                                media_resolution=mr_val,
+                            )
+                    else:
+                        if is_g4:
+                            gen_cfg = genai_types.GenerateContentConfig(
+                                response_mime_type="application/json",
+                            )
+                        else:
+                            gen_cfg = genai_types.GenerateContentConfig(
+                                temperature=0.1,
+                                response_mime_type="application/json",
+                            )
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=gen_cfg,
+                    )
+                    if response and response.text:
+                        return response.text
+                except Exception:
+                    # 非対応パラメータ時は基本設定で再試行、さらにダメならREST APIへフォールバック
+                    continue
+
+        # 2. 標準 urllib.request による Gemini REST API 直接呼び出し
+        encoded_key = urllib.parse.quote(api_key, safe="")
+        encoded_model = urllib.parse.quote(model_name, safe="-._")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{encoded_model}:generateContent?key={encoded_key}"
+        parts_payload: List[Dict[str, Any]] = []
+
+        if image is not None:
+            buf = io.BytesIO()
+            image.save(buf, format="PNG")
+            b64_data = base64.b64encode(buf.getvalue()).decode("ascii")
+            parts_payload.append({
+                "inline_data": {
+                    "mime_type": "image/png",
+                    "data": b64_data,
+                }
+            })
+
+        parts_payload.append({"text": prompt})
+
+        for try_mr in ([True, False] if use_mr else [False]):
+            gen_config: Dict[str, Any] = {
+                "responseMimeType": "application/json",
+            }
+            if not is_g4:
+                gen_config["temperature"] = 0.1
+            if try_mr:
+                gen_config["mediaResolution"] = "MEDIA_RESOLUTION_HIGH"
+
+            payload = {
+                "contents": [{"parts": parts_payload}],
+                "generationConfig": gen_config,
+            }
+
+            req_bytes = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=req_bytes,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    resp_body = resp.read().decode("utf-8")
+                    resp_json = json.loads(resp_body)
+                    candidates = resp_json.get("candidates", [])
+                    if candidates:
+                        c_parts = candidates[0].get("content", {}).get("parts", [])
+                        texts = [p.get("text", "") for p in c_parts if "text" in p]
+                        return "\n".join(texts)
+                    raise ValueError(f"Gemini APIから有効な候補が返されませんでした: {resp_body[:200]}")
+            except urllib.error.HTTPError as he:
+                err_detail = ""
+                try:
+                    err_detail = he.read().decode("utf-8")
+                except Exception:
+                    pass
+                # mediaResolution 非対応モデルで 400 が返った場合は基本パラメータでリトライ
+                if he.code == 400 and try_mr:
+                    continue
+                raise RuntimeError(f"Gemini API HTTPエラー ({he.code}): {err_detail[:300]}")
+            except Exception as e:
+                raise RuntimeError(f"Gemini API 通信エラー: {e}")
+
+        raise RuntimeError("Gemini API の呼び出しに失敗しました。")
+
+    @staticmethod
+    def _extract_json_dict(raw_text: str) -> Dict[str, Any]:
+        cleaned = raw_text.strip()
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        try:
+            obj = json.loads(cleaned)
+            if isinstance(obj, dict):
+                return obj
+            if isinstance(obj, list):
+                return {"parts": obj}
+        except Exception:
+            pass
+        m = re.search(r"\{[\s\S]*\}", cleaned)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                pass
+        raise ValueError("AI応答からJSONデータを解析できませんでした。")
+
+
+# ==============================================================================
+# ローカル 2D図面解析エンジン層 (PDF & CAD DXF)
+# ==============================================================================
+
+SUPPORTED_IMAGE_EXTENSIONS: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
+SUPPORTED_DRAWING_EXTENSIONS: Tuple[str, ...] = (".pdf", ".dxf") + SUPPORTED_IMAGE_EXTENSIONS
+
+
+class DrawingParserEngine:
     @classmethod
     def parse_file(cls, file_path: str) -> Tuple[DrawingDocument, List[PartItem]]:
         ext = os.path.splitext(file_path)[1].lower()
@@ -682,12 +1584,30 @@ class DrawingParserEngine:
             return cls.parse_pdf(file_path)
         elif ext == ".dxf":
             return cls.parse_dxf(file_path)
-        else:
-            raise ValueError(f"未対応のファイル形式です: {ext} (対応形式: .pdf, .dxf)")
+        elif ext in SUPPORTED_IMAGE_EXTENSIONS:
+            return cls.parse_image(file_path)
+        raise ValueError(f"未対応のファイル形式です: {ext} (対応: PDF, DXF, PNG, JPG, BMP, TIFF, WEBP)")
 
-    # --------------------------------------------------------------------------
-    # PDF 図面解析
-    # --------------------------------------------------------------------------
+    @classmethod
+    def parse_image(cls, file_path: str) -> Tuple[DrawingDocument, List[PartItem]]:
+        file_name = os.path.basename(file_path)
+        doc_model = DrawingDocument(file_path=file_path, file_name=file_name, file_type="IMAGE")
+        with Image.open(file_path) as src_img:
+            rgb_img = src_img.convert("RGB")
+        iw, ih = rgb_img.size
+        page_data = DrawingPageData(
+            page_no=1,
+            width=float(max(iw, 1)),
+            height=float(max(ih, 1)),
+            preview_image=rgb_img,
+            tokens=[],
+            title_meta={"drawing_title": os.path.splitext(file_name)[0], "drawing_number": "", "material": ""},
+        )
+        doc_model.drawing_title = os.path.splitext(file_name)[0]
+        doc_model.pages.append(page_data)
+        doc_model.extracted_count = 0
+        return doc_model, []
+
     @classmethod
     def parse_pdf(cls, file_path: str) -> Tuple[DrawingDocument, List[PartItem]]:
         file_name = os.path.basename(file_path)
@@ -699,66 +1619,31 @@ class DrawingParserEngine:
             for page_idx in range(len(pdf_doc)):
                 page = pdf_doc[page_idx]
                 page_no = page_idx + 1
-                rect = page.rect
-                width, height = float(rect.width), float(rect.height)
+                width, height = float(page.rect.width), float(page.rect.height)
 
-                # プレビュー画像のレンダリング (長辺が約1600pxになるようにスケール調整)
-                max_dim = max(width, height, 1.0)
-                zoom = min(max(1600.0 / max_dim, 1.2), 3.0)
-                mat = fitz.Matrix(zoom, zoom)
-                pix = page.get_pixmap(matrix=mat, alpha=False)
+                zoom = min(max(1700.0 / max(width, height, 1.0), 1.3), 3.0)
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-                # テキストワード群の座標取得
-                tokens: List[TextToken] = []
-                words = page.get_text("words")
-                for w in words:
-                    # w = (x0, y0, x1, y1, "word", block_no, line_no, word_no)
-                    txt = str(w[4]).strip()
-                    if txt:
-                        tokens.append(
-                            TextToken(
-                                text=txt,
-                                x0=float(w[0]),
-                                y0=float(w[1]),
-                                x1=float(w[2]),
-                                y1=float(w[3]),
-                                page_no=page_no,
-                            )
-                        )
+                tokens = [
+                    TextToken(str(w[4]).strip(), float(w[0]), float(w[1]), float(w[2]), float(w[3]), page_no)
+                    for w in page.get_text("words") if str(w[4]).strip()
+                ]
+                page_data = DrawingPageData(page_no=page_no, width=width, height=height, preview_image=img, tokens=tokens)
 
-                page_data = DrawingPageData(
-                    page_no=page_no,
-                    width=width,
-                    height=height,
-                    preview_image=img,
-                    tokens=tokens,
-                )
-
-                # 1. PyMuPDFのテーブル構造検出を試行
                 page_parts: List[PartItem] = []
                 try:
-                    tabs = page.find_tables()
-                    for tab in tabs:
+                    for tab in page.find_tables():
                         extracted = tab.extract()
                         if extracted and len(extracted) >= 2:
-                            page_data.raw_tables.append(extracted)
-                            tab_bbox = tuple(float(v) for v in tab.bbox)
-                            parts_from_tab = cls._extract_parts_from_2d_cells(
-                                extracted, file_name, page_no, tab_bbox
-                            )
-                            page_parts.extend(parts_from_tab)
+                            tb_bbox = tuple(float(v) for v in tab.bbox)
+                            page_parts.extend(cls._extract_parts_from_2d_cells(extracted, file_name, page_no, tb_bbox))
                 except Exception:
                     pass
 
-                # 2. テーブル検出で部品が取れなかった場合（または追加で）空間座標クラスタリング解析を実行
                 if not page_parts and tokens:
-                    clustered_parts = cls.extract_parts_from_tokens(
-                        tokens, file_name, page_no, (0.0, 0.0, width, height)
-                    )
-                    page_parts.extend(clustered_parts)
+                    page_parts.extend(cls.extract_parts_from_tokens(tokens, file_name, page_no, (0.0, 0.0, width, height)))
 
-                # 表題欄メタデータの推定
                 title_meta = cls._detect_title_block_meta(tokens, width, height)
                 page_data.title_meta = title_meta
                 if title_meta.get("drawing_title") and not doc_model.drawing_title:
@@ -766,21 +1651,10 @@ class DrawingParserEngine:
                 if title_meta.get("drawing_number") and not doc_model.drawing_number:
                     doc_model.drawing_number = title_meta["drawing_number"]
 
-                # 単品図（部品表がなく表題欄のみある図面）の場合のフォールバック生成
-                if not page_parts and title_meta.get("drawing_title"):
-                    single_item = PartItem(
-                        item_no="1",
-                        part_number=title_meta.get("drawing_number", os.path.splitext(file_name)[0]),
-                        part_name=title_meta.get("drawing_title", ""),
-                        material=title_meta.get("material", "SS400"),
-                        treatment=title_meta.get("treatment", ""),
-                        quantity=1.0,
-                        unit="個",
-                        source_file=file_name,
-                        source_page=page_no,
-                        bbox=(width * 0.55, height * 0.75, width * 0.98, height * 0.98),
-                    )
-                    page_parts.append(single_item)
+                if not page_parts and tokens:
+                    single_part = cls._extract_single_part_fallback(tokens, title_meta, file_name, page_no, width, height)
+                    if single_part:
+                        page_parts.append(single_part)
 
                 doc_model.pages.append(page_data)
                 all_parts.extend(page_parts)
@@ -790,220 +1664,133 @@ class DrawingParserEngine:
         doc_model.extracted_count = len(all_parts)
         return doc_model, all_parts
 
-    # --------------------------------------------------------------------------
-    # DXF (2D CAD) 図面解析＆ベクタープレビュー生成
-    # --------------------------------------------------------------------------
     @classmethod
     def parse_dxf(cls, file_path: str) -> Tuple[DrawingDocument, List[PartItem]]:
         file_name = os.path.basename(file_path)
         doc_model = DrawingDocument(file_path=file_path, file_name=file_name, file_type="DXF")
         all_parts: List[PartItem] = []
 
-        # DXF読み込み（エンコーディング配慮）
         try:
             dxf_doc = ezdxf.readfile(file_path)
         except UnicodeDecodeError:
             dxf_doc = ezdxf.readfile(file_path, encoding="cp932")
 
         msp = dxf_doc.modelspace()
-
-        # 1. 幾何エンティティとテキストを走査してバウンディングボックスを算出
-        raw_texts: List[Tuple[str, float, float, float]] = []  # (text, x, y, height)
-        lines_data: List[Tuple[float, float, float, float, str]] = []  # (x0, y0, x1, y1, color_hint)
-        circles_data: List[Tuple[float, float, float]] = []  # (cx, cy, r)
+        raw_texts: List[Tuple[str, float, float, float]] = []
+        lines_data: List[Tuple[float, float, float, float, str]] = []
+        circles_data: List[Tuple[float, float, float]] = []
         attrib_parts: List[PartItem] = []
-
-        min_x, min_y = float("inf"), float("inf")
-        max_x, max_y = float("-inf"), float("-inf")
+        min_x, min_y, max_x, max_y = float("inf"), float("inf"), float("-inf"), float("-inf")
 
         def update_bounds(x: float, y: float) -> None:
             nonlocal min_x, min_y, max_x, max_y
             if math.isfinite(x) and math.isfinite(y):
-                min_x = min(min_x, x)
-                min_y = min(min_y, y)
-                max_x = max(max_x, x)
-                max_y = max(max_y, y)
+                min_x, min_y, max_x, max_y = min(min_x, x), min(min_y, y), max(max_x, x), max(max_y, y)
 
-        def collect_entity(entity: Any, offset_x: float = 0.0, offset_y: float = 0.0) -> None:
-            etype = entity.dxftype()
+        def collect_entity(ent: Any, ox: float = 0.0, oy: float = 0.0) -> None:
+            et = ent.dxftype()
             try:
-                if etype == "LINE":
-                    s = entity.dxf.start
-                    e = entity.dxf.end
-                    x0, y0 = float(s.x) + offset_x, float(s.y) + offset_y
-                    x1, y1 = float(e.x) + offset_x, float(e.y) + offset_y
+                if et == "LINE":
+                    x0, y0 = float(ent.dxf.start.x) + ox, float(ent.dxf.start.y) + oy
+                    x1, y1 = float(ent.dxf.end.x) + ox, float(ent.dxf.end.y) + oy
                     lines_data.append((x0, y0, x1, y1, "line"))
                     update_bounds(x0, y0)
                     update_bounds(x1, y1)
-
-                elif etype == "LWPOLYLINE":
-                    pts = list(entity.get_points("xy"))
-                    if len(pts) >= 2:
-                        for i in range(len(pts) - 1):
-                            x0, y0 = float(pts[i][0]) + offset_x, float(pts[i][1]) + offset_y
-                            x1, y1 = float(pts[i + 1][0]) + offset_x, float(pts[i + 1][1]) + offset_y
-                            lines_data.append((x0, y0, x1, y1, "poly"))
-                            update_bounds(x0, y0)
-                            update_bounds(x1, y1)
-                        if entity.closed:
-                            x0, y0 = float(pts[-1][0]) + offset_x, float(pts[-1][1]) + offset_y
-                            x1, y1 = float(pts[0][0]) + offset_x, float(pts[0][1]) + offset_y
-                            lines_data.append((x0, y0, x1, y1, "poly"))
-
-                elif etype == "CIRCLE":
-                    c = entity.dxf.center
-                    r = float(entity.dxf.radius)
-                    cx, cy = float(c.x) + offset_x, float(c.y) + offset_y
+                elif et == "LWPOLYLINE":
+                    pts = list(ent.get_points("xy"))
+                    for i in range(len(pts) - 1):
+                        x0, y0, x1, y1 = float(pts[i][0]) + ox, float(pts[i][1]) + oy, float(pts[i + 1][0]) + ox, float(pts[i + 1][1]) + oy
+                        lines_data.append((x0, y0, x1, y1, "poly"))
+                        update_bounds(x0, y0)
+                        update_bounds(x1, y1)
+                    if ent.closed and len(pts) >= 2:
+                        lines_data.append((float(pts[-1][0]) + ox, float(pts[-1][1]) + oy, float(pts[0][0]) + ox, float(pts[0][1]) + oy, "poly"))
+                elif et in ("CIRCLE", "ARC"):
+                    cx, cy, r = float(ent.dxf.center.x) + ox, float(ent.dxf.center.y) + oy, float(ent.dxf.radius)
                     circles_data.append((cx, cy, r))
                     update_bounds(cx - r, cy - r)
                     update_bounds(cx + r, cy + r)
-
-                elif etype == "ARC":
-                    c = entity.dxf.center
-                    r = float(entity.dxf.radius)
-                    cx, cy = float(c.x) + offset_x, float(c.y) + offset_y
-                    circles_data.append((cx, cy, r))
-                    update_bounds(cx - r, cy - r)
-                    update_bounds(cx + r, cy + r)
-
-                elif etype == "TEXT":
-                    txt = str(entity.dxf.text).strip()
+                elif et == "TEXT":
+                    txt = str(ent.dxf.text).strip()
                     if txt:
-                        ins = entity.dxf.insert
-                        tx, ty = float(ins.x) + offset_x, float(ins.y) + offset_y
-                        th = float(getattr(entity.dxf, "height", 3.5))
+                        tx, ty = float(ent.dxf.insert.x) + ox, float(ent.dxf.insert.y) + oy
+                        th = float(getattr(ent.dxf, "height", 3.5))
                         raw_texts.append((txt, tx, ty, th))
                         update_bounds(tx, ty)
-                        update_bounds(tx + len(txt) * th * 0.8, ty + th)
-
-                elif etype == "MTEXT":
-                    txt = entity.plain_text().strip()
+                elif et == "MTEXT":
+                    txt = ent.plain_text().strip()
                     if txt:
-                        ins = entity.dxf.insert
-                        tx, ty = float(ins.x) + offset_x, float(ins.y) + offset_y
-                        th = float(getattr(entity.dxf, "char_height", 3.5))
-                        for line_idx, line_str in enumerate(txt.splitlines()):
-                            line_str = line_str.strip()
-                            if line_str:
-                                ly = ty - line_idx * (th * 1.4)
-                                raw_texts.append((line_str, tx, ly, th))
-                                update_bounds(tx, ly)
-
-                elif etype == "INSERT":
-                    ins = entity.dxf.insert
-                    ix, iy = float(ins.x) + offset_x, float(ins.y) + offset_y
+                        tx, ty = float(ent.dxf.insert.x) + ox, float(ent.dxf.insert.y) + oy
+                        th = float(getattr(ent.dxf, "char_height", 3.5))
+                        for l_i, line_s in enumerate(txt.splitlines()):
+                            if line_s.strip():
+                                raw_texts.append((line_s.strip(), tx, ty - l_i * th * 1.4, th))
+                                update_bounds(tx, ty)
+                elif et == "INSERT":
+                    ix, iy = float(ent.dxf.insert.x) + ox, float(ent.dxf.insert.y) + oy
                     update_bounds(ix, iy)
-                    # ブロック属性(ATTRIB)の抽出
-                    if hasattr(entity, "attribs") and len(entity.attribs) > 0:
-                        attr_dict: Dict[str, str] = {}
-                        for att in entity.attribs:
-                            tag = str(att.dxf.tag).upper().strip()
+                    if hasattr(ent, "attribs") and ent.attribs:
+                        ad: Dict[str, str] = {}
+                        for att in ent.attribs:
                             val = str(att.dxf.text).strip()
                             if val:
-                                attr_dict[tag] = val
-                                a_ins = att.dxf.insert
-                                ax, ay = float(a_ins.x), float(a_ins.y)
-                                raw_texts.append((val, ax, ay, 3.5))
-                        part_from_attr = cls._part_from_dxf_attribs(attr_dict, file_name, len(attrib_parts) + 1)
-                        if part_from_attr:
-                            attrib_parts.append(part_from_attr)
-
-                    # ブロック内図形の展開（1階層）
-                    bname = entity.dxf.name
+                                ad[str(att.dxf.tag).upper().strip()] = val
+                                raw_texts.append((val, float(att.dxf.insert.x), float(att.dxf.insert.y), 3.5))
+                        p_attr = cls._part_from_dxf_attribs(ad, file_name, len(attrib_parts) + 1)
+                        if p_attr:
+                            attrib_parts.append(p_attr)
+                    bname = ent.dxf.name
                     if bname in dxf_doc.blocks:
-                        blk = dxf_doc.blocks[bname]
-                        for sub_e in blk:
+                        for sub_e in dxf_doc.blocks[bname]:
                             if sub_e.dxftype() in ("LINE", "LWPOLYLINE", "CIRCLE", "TEXT", "MTEXT"):
                                 collect_entity(sub_e, ix, iy)
             except Exception:
                 pass
 
-        for ent in msp:
-            collect_entity(ent)
+        for e in msp:
+            collect_entity(e)
 
-        if not math.isfinite(min_x) or not math.isfinite(max_x) or max_x <= min_x:
+        if not math.isfinite(min_x) or max_x <= min_x:
             min_x, min_y, max_x, max_y = 0.0, 0.0, 420.0, 297.0
+        mx, my = max((max_x - min_x) * 0.04, 10.0), max((max_y - min_y) * 0.04, 10.0)
+        min_x, min_y, max_x, max_y = min_x - mx, min_y - my, max_x + mx, max_y + my
+        world_w, world_h = max(max_x - min_x, 1.0), max(max_y - min_y, 1.0)
 
-        margin_x = max((max_x - min_x) * 0.04, 10.0)
-        margin_y = max((max_y - min_y) * 0.04, 10.0)
-        min_x -= margin_x
-        min_y -= margin_y
-        max_x += margin_x
-        max_y += margin_y
-
-        world_w = max(max_x - min_x, 1.0)
-        world_h = max(max_y - min_y, 1.0)
-
-        # DXFはY軸が上向きなので、画面座標系(左上原点、Y軸下向き)に変換
         tokens: List[TextToken] = []
         for txt, tx, ty, th in raw_texts:
-            sx0 = tx - min_x
-            sy1 = max_y - ty
+            sx0, sy1 = tx - min_x, max_y - ty
             sy0 = max(0.0, sy1 - max(th * 1.2, 4.0))
             sx1 = sx0 + max(len(txt) * th * 0.85, 8.0)
-            tokens.append(
-                TextToken(
-                    text=txt,
-                    x0=sx0,
-                    y0=sy0,
-                    x1=sx1,
-                    y1=sy1,
-                    page_no=1,
-                )
-            )
+            tokens.append(TextToken(txt, sx0, sy0, sx1, sy1, 1))
 
-        # DXFの2Dプレビュー画像を生成
-        preview_img = cls._render_dxf_preview(
-            world_w, world_h, min_x, max_y, lines_data, circles_data, tokens
-        )
+        preview_img = cls._render_dxf_preview(world_w, world_h, min_x, max_y, lines_data, circles_data, tokens)
+        page_data = DrawingPageData(page_no=1, width=world_w, height=world_h, preview_image=preview_img, tokens=tokens)
 
-        page_data = DrawingPageData(
-            page_no=1,
-            width=world_w,
-            height=world_h,
-            preview_image=preview_img,
-            tokens=tokens,
-        )
-
-        # 部品抽出: 1. ブロック属性 -> 2. 空間座標クラスタリング
-        if attrib_parts:
-            all_parts.extend(attrib_parts)
-
-        clustered_parts = cls.extract_parts_from_tokens(
-            tokens, file_name, 1, (0.0, 0.0, world_w, world_h)
-        )
-        # 重複を避けてマージ
-        existing_keys = {(p.part_number, p.part_name) for p in all_parts}
-        for cp in clustered_parts:
-            if (cp.part_number, cp.part_name) not in existing_keys:
+        all_parts.extend(attrib_parts)
+        existing = {(p.part_number, p.part_name) for p in all_parts}
+        for cp in cls.extract_parts_from_tokens(tokens, file_name, 1, (0.0, 0.0, world_w, world_h)):
+            if (cp.part_number, cp.part_name) not in existing:
                 all_parts.append(cp)
-
-        # 連番振り直し
-        for idx, p in enumerate(all_parts, start=1):
-            if not p.item_no or p.item_no == "0":
-                p.item_no = str(idx)
 
         title_meta = cls._detect_title_block_meta(tokens, world_w, world_h)
         page_data.title_meta = title_meta
         doc_model.drawing_title = title_meta.get("drawing_title", "")
         doc_model.drawing_number = title_meta.get("drawing_number", "")
+        if not all_parts and tokens:
+            single_part = cls._extract_single_part_fallback(tokens, title_meta, file_name, 1, world_w, world_h)
+            if single_part:
+                all_parts.append(single_part)
         doc_model.pages.append(page_data)
         doc_model.extracted_count = len(all_parts)
-
         return doc_model, all_parts
 
     @classmethod
     def _render_dxf_preview(
-        cls,
-        world_w: float,
-        world_h: float,
-        min_x: float,
-        max_y: float,
+        cls, world_w: float, world_h: float, min_x: float, max_y: float,
         lines_data: List[Tuple[float, float, float, float, str]],
         circles_data: List[Tuple[float, float, float]],
         tokens: List[TextToken],
     ) -> Image.Image:
-        """DXFの線分・円・テキストをPillow画像に美しくベクターレンダリングする"""
         target_w = 1600
         scale = target_w / max(world_w, 1.0)
         target_h = int(max(min(world_h * scale, 2200), 600))
@@ -1011,411 +1798,306 @@ class DrawingParserEngine:
 
         img = Image.new("RGB", (target_w, target_h), (255, 255, 255))
         draw = ImageDraw.Draw(img)
-
-        # フォント準備 (Windows 11 標準日本語フォント)
         font_sm = None
-        for font_path in [
-            "C:/Windows/Fonts/meiryo.ttc",
-            "C:/Windows/Fonts/YuGothM.ttc",
-            "C:/Windows/Fonts/msgothic.ttc",
-        ]:
-            if os.path.exists(font_path):
+        for fp in ["C:/Windows/Fonts/meiryo.ttc", "C:/Windows/Fonts/YuGothM.ttc", "C:/Windows/Fonts/msgothic.ttc"]:
+            if os.path.exists(fp):
                 try:
-                    font_sm = ImageFont.truetype(font_path, 12)
+                    font_sm = ImageFont.truetype(fp, 13)
                     break
                 except Exception:
                     pass
 
-        # 線分描画
         for x0, y0, x1, y1, kind in lines_data:
-            px0 = int((x0 - min_x) * scale)
-            py0 = int((max_y - y0) * scale)
-            px1 = int((x1 - min_x) * scale)
-            py1 = int((max_y - y1) * scale)
-            color = (30, 58, 138) if kind == "poly" else (15, 23, 42)
-            draw.line([(px0, py0), (px1, py1)], fill=color, width=2)
+            c = (30, 58, 138) if kind == "poly" else (15, 23, 42)
+            draw.line([(int((x0 - min_x) * scale), int((max_y - y0) * scale)), (int((x1 - min_x) * scale), int((max_y - y1) * scale))], fill=c, width=2)
 
-        # 円描画
         for cx, cy, r in circles_data:
-            px0 = int((cx - r - min_x) * scale)
-            py0 = int((max_y - (cy + r)) * scale)
-            px1 = int((cx + r - min_x) * scale)
-            py1 = int((max_y - (cy - r)) * scale)
+            px0, py0 = int((cx - r - min_x) * scale), int((max_y - (cy + r)) * scale)
+            px1, py1 = int((cx + r - min_x) * scale), int((max_y - (cy - r)) * scale)
             if px1 > px0 and py1 > py0:
                 draw.ellipse([px0, py0, px1, py1], outline=(37, 99, 235), width=2)
 
-        # テキスト描画
         for tk_item in tokens:
-            px = int(tk_item.x0 * scale)
-            py = int(tk_item.y0 * scale)
-            draw.text((px, py), tk_item.text, fill=(15, 23, 42), font=font_sm)
-
+            draw.text((int(tk_item.x0 * scale), int(tk_item.y0 * scale)), tk_item.text, fill=(15, 23, 42), font=font_sm)
         return img
 
     @classmethod
-    def _part_from_dxf_attribs(
-        cls, attr_dict: Dict[str, str], source_file: str, idx: int
-    ) -> Optional[PartItem]:
-        """DXFブロック属性辞書からPartItemを生成する"""
+    def _part_from_dxf_attribs(cls, attr_dict: Dict[str, str], source_file: str, idx: int) -> Optional[PartItem]:
         if not attr_dict:
             return None
         item = PartItem(item_no=str(idx), source_file=source_file, source_page=1)
         for tag, val in attr_dict.items():
-            t = tag.upper()
-            if any(k in t for k in ["NO", "POS", "ITEM", "番号", "符号"]):
-                if re.fullmatch(r"\d+", val):
-                    item.item_no = val
-                elif not item.part_number:
-                    item.part_number = val
-            elif any(k in t for k in ["DWG", "PART_NO", "CODE", "図番", "品番"]):
+            if any(k in tag for k in ["DWG", "PART_NO", "CODE", "図番", "品番"]):
                 item.part_number = val
-            elif any(k in t for k in ["NAME", "DESC", "TITLE", "品名", "名称"]):
+            elif any(k in tag for k in ["NAME", "DESC", "TITLE", "品名", "名称"]):
                 item.part_name = val
-            elif any(k in t for k in ["SPEC", "SIZE", "DIM", "MODEL", "型式", "寸法", "仕様"]):
+            elif any(k in tag for k in ["SPEC", "SIZE", "DIM", "型式", "寸法"]):
                 item.specification = val
-            elif any(k in t for k in ["MAT", "材質", "材料"]):
+            elif any(k in tag for k in ["MAT", "材質", "材料"]):
                 item.material = val
-            elif any(k in t for k in ["FINISH", "TREAT", "表面処理", "処理"]):
+            elif any(k in tag for k in ["FINISH", "TREAT", "表面処理"]):
                 item.treatment = val
-            elif any(k in t for k in ["QTY", "COUNT", "数量", "個数"]):
+            elif any(k in tag for k in ["QTY", "COUNT", "数量"]):
                 m = re.search(r"\d+(?:\.\d+)?", val)
                 if m:
                     item.quantity = float(m.group(0))
-            elif any(k in t for k in ["WEIGHT", "MASS", "単重", "重量"]):
-                m = re.search(r"\d+(?:\.\d+)?", val)
-                if m:
-                    item.unit_weight = float(m.group(0))
-            elif any(k in t for k in ["MAKER", "VENDOR", "メーカー", "メーカ"]):
-                item.manufacturer = val
-            elif any(k in t for k in ["REMARK", "NOTE", "備考"]):
-                item.remarks = val
-
         if not item.part_name and not item.part_number:
             return None
         if item.unit_weight == 0.0 and item.specification:
             item.unit_weight = SmartPartAnalyzer.estimate_weight_from_spec(item.specification, item.material)
-        item.category = SmartPartAnalyzer.detect_category(
-            item.part_name, item.specification, item.material, item.manufacturer
-        )
+        item.category = SmartPartAnalyzer.detect_category(item.part_name, item.specification, item.material, item.manufacturer)
         return item
 
-    # --------------------------------------------------------------------------
-    # 2Dテーブルおよび空間座標クラスタリングによる部品表抽出
-    # --------------------------------------------------------------------------
     @classmethod
     def _extract_parts_from_2d_cells(
-        cls,
-        rows: List[List[Any]],
-        source_file: str,
-        page_no: int,
-        table_bbox: Tuple[float, float, float, float],
+        cls, rows: List[List[Any]], source_file: str, page_no: int, table_bbox: Tuple[float, float, float, float]
     ) -> List[PartItem]:
-        """2次元セル配列からヘッダー位置を特定してPartItemリストを抽出する"""
-        cleaned_rows: List[List[str]] = []
-        for r in rows:
-            cleaned_r = [SmartPartAnalyzer.normalize_text(str(c) if c is not None else "") for c in r]
-            if any(cleaned_r):
-                cleaned_rows.append(cleaned_r)
-
+        cleaned_rows = [[SmartPartAnalyzer.normalize_text(str(c) if c is not None else "") for c in r] for r in rows]
+        cleaned_rows = [r for r in cleaned_rows if any(r)]
         if len(cleaned_rows) < 2:
             return []
 
-        # ヘッダー行を探す（上から順、または下から上に積まれる部品表のため最下行もチェック）
-        header_idx = -1
-        col_map: Dict[int, str] = {}
-        bottom_up = False
-
+        header_idx, col_map, bottom_up = -1, {}, False
         for idx, r in enumerate(cleaned_rows):
             cmap = SmartPartAnalyzer.classify_table_headers(r)
-            if len(cmap) >= 2 and ("part_name" in cmap.values() or "part_number" in cmap.values() or "material" in cmap.values()):
-                header_idx = idx
-                col_map = cmap
-                if idx == len(cleaned_rows) - 1:
-                    bottom_up = True
+            if len(cmap) >= 2 and ("part_name" in cmap.values() or "part_number" in cmap.values()):
+                header_idx, col_map = idx, cmap
+                bottom_up = (idx == len(cleaned_rows) - 1)
                 break
 
         results: List[PartItem] = []
-        total_rows = max(len(cleaned_rows), 1)
         bx0, by0, bx1, by1 = table_bbox
-        row_h = (by1 - by0) / total_rows
+        row_h = (by1 - by0) / max(len(cleaned_rows), 1)
 
         if header_idx != -1:
-            data_indices = (
-                range(header_idx - 1, -1, -1) if bottom_up else range(header_idx + 1, len(cleaned_rows))
-            )
-            for seq_idx, r_idx in enumerate(data_indices, start=1):
-                r = cleaned_rows[r_idx]
-                row_bbox = (bx0, by0 + r_idx * row_h, bx1, by0 + (r_idx + 1) * row_h)
-                item = cls._map_row_with_col_map(r, col_map, seq_idx, source_file, page_no, row_bbox)
+            indices = range(header_idx - 1, -1, -1) if bottom_up else range(header_idx + 1, len(cleaned_rows))
+            for seq_idx, r_idx in enumerate(indices, start=1):
+                rb = (bx0, by0 + r_idx * row_h, bx1, by0 + (r_idx + 1) * row_h)
+                item = cls._map_row_with_col_map(cleaned_rows[r_idx], col_map, seq_idx, source_file, page_no, rb)
                 if item:
                     results.append(item)
         else:
             for seq_idx, r in enumerate(cleaned_rows, start=1):
-                row_bbox = (bx0, by0 + (seq_idx - 1) * row_h, bx1, by0 + seq_idx * row_h)
-                item = SmartPartAnalyzer.parse_unstructured_row(r, seq_idx, source_file, page_no, row_bbox)
+                rb = (bx0, by0 + (seq_idx - 1) * row_h, bx1, by0 + seq_idx * row_h)
+                item = SmartPartAnalyzer.parse_unstructured_row(r, seq_idx, source_file, page_no, rb)
                 if item:
                     results.append(item)
-
         return results
 
     @classmethod
     def _map_row_with_col_map(
-        cls,
-        row_cells: List[str],
-        col_map: Dict[int, str],
-        default_no: int,
-        source_file: str,
-        page_no: int,
-        bbox: Tuple[float, float, float, float],
+        cls, row_cells: List[str], col_map: Dict[int, str], default_no: int,
+        source_file: str, page_no: int, bbox: Tuple[float, float, float, float]
     ) -> Optional[PartItem]:
-        """ヘッダーマッピングに従って1行のセル群をPartItemに変換する"""
         if not any(row_cells):
             return None
-
-        # 別のヘッダーや集計行はスキップ
         joined = " ".join(row_cells)
-        if any(w in joined for w in ["部品表", "PARTS LIST", "BILL OF MATERIALS", "第三角法", "PROJECTION"]):
+        if any(w in joined for w in ["部品表", "PARTS LIST", "BILL OF MATERIALS", "第三角法"]):
             return None
 
-        item = PartItem(
-            item_no=str(default_no),
-            source_file=source_file,
-            source_page=page_no,
-            bbox=bbox,
-        )
+        item = PartItem(item_no=str(default_no), source_file=source_file, source_page=page_no, bbox=bbox)
+        unmapped: List[str] = []
 
-        unmapped_texts: List[str] = []
         for c_idx, val in enumerate(row_cells):
             val = val.strip()
             if not val:
                 continue
-            field_name = col_map.get(c_idx)
-            if field_name == "item_no":
+            fn = col_map.get(c_idx)
+            if fn == "item_no":
                 item.item_no = val
-            elif field_name == "part_number":
+            elif fn == "part_number":
                 item.part_number = val
-            elif field_name == "part_name":
+            elif fn == "part_name":
                 item.part_name = val
-            elif field_name == "specification":
+            elif fn == "specification":
                 item.specification = val
-            elif field_name == "material":
+            elif fn == "material":
                 mat, _ = SmartPartAnalyzer.detect_material(val)
                 item.material = mat if mat else val
-                treat = SmartPartAnalyzer.detect_treatment(val)
-                if treat and not item.treatment:
-                    item.treatment = treat
-            elif field_name == "treatment":
+            elif fn == "treatment":
                 item.treatment = val
-            elif field_name == "quantity":
+            elif fn == "quantity":
                 m = re.search(r"\d+(?:\.\d+)?", val)
                 if m:
                     item.quantity = float(m.group(0))
-                u = re.search(r"(個|本|枚|式|組|セット|m|kg)", val)
-                if u:
-                    item.unit = u.group(1)
-            elif field_name == "unit":
+            elif fn == "unit":
                 item.unit = val
-            elif field_name == "unit_weight":
+            elif fn == "unit_weight":
                 m = re.search(r"\d+(?:\.\d+)?", val)
                 if m:
                     item.unit_weight = float(m.group(0))
-            elif field_name == "manufacturer":
+            elif fn == "manufacturer":
                 item.manufacturer = val
-            elif field_name == "unit_price":
-                m = re.search(r"[\d,]+(?:\.\d+)?", val)
-                if m:
-                    item.unit_price = float(m.group(0).replace(",", ""))
-            elif field_name == "remarks":
+            elif fn == "remarks":
                 item.remarks = val
             else:
-                unmapped_texts.append(val)
+                unmapped.append(val)
 
-        # 未マッピング列に重要情報があれば補完
-        for extra in unmapped_texts:
+        for ex in unmapped:
             if not item.material:
-                mat, _ = SmartPartAnalyzer.detect_material(extra)
+                mat, _ = SmartPartAnalyzer.detect_material(ex)
                 if mat:
                     item.material = mat
                     continue
-            if not item.treatment:
-                treat = SmartPartAnalyzer.detect_treatment(extra)
-                if treat:
-                    item.treatment = treat
-                    continue
-            if not item.specification and re.search(r"([tT]\d+|\d+[xX×]\d+|[φD]\d+|\bM\d+)", extra):
-                item.specification = extra
-                continue
             if not item.remarks:
-                item.remarks = extra
+                item.remarks = ex
 
         if not item.part_name and not item.part_number:
             return None
-
         if item.material and not item.treatment and item.material in MATERIAL_MASTER:
-            item.treatment = MATERIAL_MASTER[item.material]["default_treat"]
-
+            item.treatment = MATERIAL_MASTER[item.material]["treat"]
         if item.unit_weight == 0.0 and item.specification:
             item.unit_weight = SmartPartAnalyzer.estimate_weight_from_spec(item.specification, item.material)
-
-        item.category = SmartPartAnalyzer.detect_category(
-            item.part_name, item.specification, item.material, item.manufacturer
-        )
+        item.category = SmartPartAnalyzer.detect_category(item.part_name, item.specification, item.material, item.manufacturer)
         return item
 
     @classmethod
     def extract_parts_from_tokens(
-        cls,
-        tokens: List[TextToken],
-        source_file: str,
-        page_no: int,
-        area_rect: Tuple[float, float, float, float],
-        force_all_rows: bool = False,
+        cls, tokens: List[TextToken], source_file: str, page_no: int,
+        area_rect: Tuple[float, float, float, float], force_all_rows: bool = False
     ) -> List[PartItem]:
-        """
-        指定矩形領域内のTextToken群をY座標で行クラスタリングし、X座標で列整列して部品リストを抽出する。
-        force_all_rows=True のとき（マウス範囲選択時）はヘッダーがなくても範囲内の全有効行を部品変換する。
-        """
         ax0, ay0, ax1, ay1 = area_rect
-        filtered = [
-            t for t in tokens
-            if t.cx >= ax0 and t.cx <= ax1 and t.cy >= ay0 and t.cy <= ay1
-        ]
+        filtered = [t for t in tokens if ax0 <= t.cx <= ax1 and ay0 <= t.cy <= ay1]
         if not filtered:
             return []
 
-        # Y座標でソートし、近接するトークンを同一行（RowCluster）にまとめる
         sorted_by_y = sorted(filtered, key=lambda t: t.cy)
         avg_h = sum(max(t.y1 - t.y0, 4.0) for t in sorted_by_y) / len(sorted_by_y)
         y_tol = max(avg_h * 0.65, 3.5)
 
-        row_clusters: List[List[TextToken]] = []
+        clusters: List[List[TextToken]] = []
         for tok in sorted_by_y:
-            if not row_clusters:
-                row_clusters.append([tok])
+            if not clusters or abs(tok.cy - sum(t.cy for t in clusters[-1]) / len(clusters[-1])) > y_tol:
+                clusters.append([tok])
             else:
-                prev_cy = sum(t.cy for t in row_clusters[-1]) / len(row_clusters[-1])
-                if abs(tok.cy - prev_cy) <= y_tol:
-                    row_clusters[-1].append(tok)
-                else:
-                    row_clusters.append([tok])
+                clusters[-1].append(tok)
 
-        # 各行内でX座標順にソートし、近すぎる単語は結合、離れている単語は別セルとする
-        structured_rows: List[Tuple[List[str], List[float], Tuple[float, float, float, float]]] = []
-        for cluster in row_clusters:
-            cluster_sorted = sorted(cluster, key=lambda t: t.x0)
-            cells: List[str] = []
-            cell_xs: List[float] = []
-            cur_text = cluster_sorted[0].text
-            cur_x0 = cluster_sorted[0].x0
-            prev_x1 = cluster_sorted[0].x1
-
-            for tok in cluster_sorted[1:]:
-                gap = tok.x0 - prev_x1
-                if gap <= max(avg_h * 0.8, 5.0):
-                    cur_text = f"{cur_text} {tok.text}"
+        structured: List[Tuple[List[str], List[float], Tuple[float, float, float, float]]] = []
+        for cl in clusters:
+            cl_s = sorted(cl, key=lambda t: t.x0)
+            cells, cell_xs = [], []
+            cur_t, cur_x0, prev_x1 = cl_s[0].text, cl_s[0].x0, cl_s[0].x1
+            for tok in cl_s[1:]:
+                if tok.x0 - prev_x1 <= max(avg_h * 0.8, 5.0):
+                    cur_t = f"{cur_t} {tok.text}"
                     prev_x1 = max(prev_x1, tok.x1)
                 else:
-                    cells.append(cur_text)
+                    cells.append(cur_t)
                     cell_xs.append(cur_x0)
-                    cur_text = tok.text
-                    cur_x0 = tok.x0
-                    prev_x1 = tok.x1
-            cells.append(cur_text)
+                    cur_t, cur_x0, prev_x1 = tok.text, tok.x0, tok.x1
+            cells.append(cur_t)
             cell_xs.append(cur_x0)
+            structured.append((cells, cell_xs, (min(t.x0 for t in cl_s), min(t.y0 for t in cl_s), max(t.x1 for t in cl_s), max(t.y1 for t in cl_s))))
 
-            rx0 = min(t.x0 for t in cluster_sorted)
-            ry0 = min(t.y0 for t in cluster_sorted)
-            rx1 = max(t.x1 for t in cluster_sorted)
-            ry1 = max(t.y1 for t in cluster_sorted)
-            structured_rows.append((cells, cell_xs, (rx0, ry0, rx1, ry1)))
-
-        # ヘッダー行を探す
-        header_row_idx = -1
-        header_col_map: Dict[int, str] = {}
-        header_xs: List[float] = []
-        bottom_up = False
-
-        for r_idx, (cells, c_xs, _) in enumerate(structured_rows):
+        h_idx, h_map, h_xs, bottom_up = -1, {}, [], False
+        for r_idx, (cells, c_xs, _) in enumerate(structured):
             cmap = SmartPartAnalyzer.classify_table_headers(cells)
             if len(cmap) >= 2 and ("part_name" in cmap.values() or "part_number" in cmap.values()):
-                header_row_idx = r_idx
-                header_col_map = cmap
-                header_xs = c_xs
-                # 下側にデータ行が少なく上側にデータ行が多い場合は下から上へ積む部品欄と判定
-                if r_idx >= len(structured_rows) - 2 and r_idx >= 2:
-                    bottom_up = True
+                h_idx, h_map, h_xs = r_idx, cmap, c_xs
+                bottom_up = (r_idx >= len(structured) - 2 and r_idx >= 2)
                 break
 
-        extracted_parts: List[PartItem] = []
-
-        if header_row_idx != -1 and header_xs:
-            indices = (
-                range(header_row_idx - 1, -1, -1)
-                if bottom_up
-                else range(header_row_idx + 1, len(structured_rows))
-            )
+        extracted: List[PartItem] = []
+        if h_idx != -1 and h_xs:
+            indices = range(h_idx - 1, -1, -1) if bottom_up else range(h_idx + 1, len(structured))
             for seq_no, idx in enumerate(indices, start=1):
-                cells, c_xs, r_bbox = structured_rows[idx]
-                # ヘッダーとのX座標範囲が大きく外れている行（図面左側の注記など）は除外
-                if not force_all_rows:
-                    hx_min = min(header_xs) - 60.0
-                    if max(c_xs) < hx_min:
-                        continue
-                # 各セルのX座標を最も近いヘッダー列に割り当てる
-                aligned_cells = [""] * len(header_xs)
-                for cell_str, cx in zip(cells, c_xs):
-                    best_col = min(range(len(header_xs)), key=lambda hi: abs(cx - header_xs[hi]))
-                    if aligned_cells[best_col]:
-                        aligned_cells[best_col] = f"{aligned_cells[best_col]} {cell_str}"
-                    else:
-                        aligned_cells[best_col] = cell_str
-
-                item = cls._map_row_with_col_map(
-                    aligned_cells, header_col_map, seq_no, source_file, page_no, r_bbox
-                )
+                cells, c_xs, r_bbox = structured[idx]
+                if not force_all_rows and max(c_xs) < min(h_xs) - 60.0:
+                    continue
+                aligned = [""] * len(h_xs)
+                for cs, cx in zip(cells, c_xs):
+                    best_c = min(range(len(h_xs)), key=lambda hi: abs(cx - h_xs[hi]))
+                    aligned[best_c] = f"{aligned[best_c]} {cs}".strip()
+                item = cls._map_row_with_col_map(aligned, h_map, seq_no, source_file, page_no, r_bbox)
                 if item:
-                    extracted_parts.append(item)
+                    extracted.append(item)
         else:
-            # ヘッダーが見つからない場合（範囲選択時または材質・品番を含む行の自動検出）
             seq_no = 1
-            for cells, _, r_bbox in structured_rows:
+            for cells, _, r_bbox in structured:
                 if not force_all_rows and len(cells) < 2:
                     continue
-                item = SmartPartAnalyzer.parse_unstructured_row(
-                    cells, seq_no, source_file, page_no, r_bbox
-                )
-                if item:
-                    # 全体自動スキャン時は、材質または図番または2列以上の有効情報がある行のみ採用
-                    if force_all_rows or item.material or item.part_number or len(cells) >= 3:
-                        extracted_parts.append(item)
-                        seq_no += 1
-
-        return extracted_parts
+                item = SmartPartAnalyzer.parse_unstructured_row(cells, seq_no, source_file, page_no, r_bbox)
+                if item and (force_all_rows or item.material or item.part_number or len(cells) >= 3):
+                    extracted.append(item)
+                    seq_no += 1
+        return extracted
 
     @classmethod
-    def _detect_title_block_meta(
-        cls, tokens: List[TextToken], width: float, height: float
-    ) -> Dict[str, str]:
-        """図面右下付近の表題欄から図面名称・図番・材質を推定する"""
-        meta: Dict[str, str] = {"drawing_title": "", "drawing_number": "", "material": ""}
-        # 右下領域 (X > 45%, Y > 65%) のトークンを調べる
-        tb_tokens = [t for t in tokens if t.cx >= width * 0.45 and t.cy >= height * 0.65]
-        if not tb_tokens:
-            tb_tokens = tokens
-
+    def _detect_title_block_meta(cls, tokens: List[TextToken], width: float, height: float) -> Dict[str, str]:
+        meta = {"drawing_title": "", "drawing_number": "", "material": "", "treatment": ""}
+        tb_tokens = [t for t in tokens if t.cx >= width * 0.45 and t.cy >= height * 0.65] or tokens
         for i, tok in enumerate(tb_tokens):
             txt = SmartPartAnalyzer.normalize_text(tok.text)
             mat, _ = SmartPartAnalyzer.detect_material(txt)
             if mat and not meta["material"]:
                 meta["material"] = mat
+            treat = SmartPartAnalyzer.detect_treatment(txt)
+            if treat and not meta["treatment"]:
+                meta["treatment"] = treat
             if re.fullmatch(r"[A-Z]{2,5}-\d{3,6}(?:-\d{1,3})?", txt) and not meta["drawing_number"]:
                 meta["drawing_number"] = txt
-            if txt in ("図面名称", "名称", "品名", "TITLE", "NAME") and i + 1 < len(tb_tokens):
+            if txt in ("図面名称", "名称", "品名", "TITLE") and i + 1 < len(tb_tokens):
                 cand = SmartPartAnalyzer.normalize_text(tb_tokens[i + 1].text)
                 if len(cand) >= 2 and cand not in ("図番", "尺度", "材質", "数量"):
                     meta["drawing_title"] = cand
-
         return meta
+
+    @classmethod
+    def _extract_single_part_fallback(
+        cls,
+        tokens: List[TextToken],
+        title_meta: Dict[str, str],
+        source_file: str,
+        page_no: int,
+        width: float,
+        height: float,
+    ) -> Optional[PartItem]:
+        """部品表テーブルを持たない単品図（1部品1図面）から表題欄と材料寸法を読み取って1件の部品を構築する"""
+        p_name = title_meta.get("drawing_title", "").strip()
+        p_num = title_meta.get("drawing_number", "").strip()
+        mat = title_meta.get("material", "").strip()
+        treat = title_meta.get("treatment", "").strip()
+        spec = ""
+        bbox = (width * 0.45, height * 0.65, width * 0.98, height * 0.98)
+
+        for tok in tokens:
+            norm = SmartPartAnalyzer.normalize_text(tok.text)
+            if not mat:
+                m_cand, _ = SmartPartAnalyzer.detect_material(norm)
+                if m_cand:
+                    mat = m_cand
+            if not treat:
+                t_cand = SmartPartAnalyzer.detect_treatment(norm)
+                if t_cand:
+                    treat = t_cand
+            if not spec and re.search(r"([tT]\d+(?:\.\d+)?\s*[xX]\s*\d+|[φD]\d+(?:\.\d+)?\s*[xX]\s*\d+)", norm):
+                spec = norm
+                bbox = (tok.x0, tok.y0, tok.x1, tok.y1)
+
+        if not (p_name or p_num or (mat and spec)):
+            return None
+        if not p_name:
+            p_name = os.path.splitext(source_file)[0]
+        if mat and not treat and mat in MATERIAL_MASTER:
+            treat = MATERIAL_MASTER[mat]["treat"]
+        u_wt = SmartPartAnalyzer.estimate_weight_from_spec(spec, mat) if spec else 0.0
+        cat = SmartPartAnalyzer.detect_category(p_name, spec, mat, "")
+        return PartItem(
+            item_no="1",
+            part_number=p_num,
+            part_name=p_name,
+            specification=spec,
+            material=mat,
+            treatment=treat,
+            quantity=1.0,
+            unit="個",
+            unit_weight=u_wt,
+            category=cat,
+            source_file=source_file,
+            source_page=page_no,
+            remarks="単品図自動抽出",
+            bbox=bbox,
+        )
 
 
 # ==============================================================================
@@ -1423,8 +2105,6 @@ class DrawingParserEngine:
 # ==============================================================================
 
 class SampleDrawingGenerator:
-    """動作確認用のリアルな機械設計2D図面（組立図PDF＆ブラケット組図DXF）をその場で生成する"""
-
     SAMPLE_BOM_ROWS_PDF = [
         ["No.", "図番 / 品番", "部品名称", "型式・材料寸法", "材質", "表面処理", "数量", "単位", "単重(kg)", "備考"],
         ["1", "CV-1001-01", "メインベースフレーム", "t12x350x600", "SS400", "メラミン焼付塗装", "1", "個", "19.78", "製缶溶接構造"],
@@ -1439,7 +2119,6 @@ class SampleDrawingGenerator:
         ["10", "6005ZZ", "深溝玉軸受(ベアリング)", "内径25x外径47x幅12", "SUJ2", "焼入れ", "2", "個", "0.08", "NSK製"],
         ["11", "BLM5120-15S", "ブラシレスモータ&ギヤヘッド", "120W 減速比1:15", "-", "-", "1", "式", "3.20", "オリエンタルモーター"],
         ["12", "CB-M8-25", "六角穴付ボルト", "M8x25", "SCM435", "四三酸化鉄皮膜", "16", "本", "0.015", "標準部品"],
-        ["13", "CB-M6-16", "六角穴付ボルト", "M6x16", "SUS304", "生地", "8", "本", "0.006", "標準部品"],
     ]
 
     SAMPLE_BOM_ROWS_DXF = [
@@ -1453,199 +2132,94 @@ class SampleDrawingGenerator:
 
     @classmethod
     def create_sample_pdf(cls, output_path: str) -> str:
-        """A3横サイズ相当(1190 x 842 pt)のベクター2D機械組立図PDFを生成する"""
         doc = fitz.open()
         page = doc.new_page(width=1190, height=842)
         shape = page.new_shape()
 
-        # 1. 図面外枠・内枠の描画
         shape.draw_rect(fitz.Rect(20, 20, 1170, 822))
         shape.finish(color=(0.05, 0.1, 0.25), width=2.0)
         shape.draw_rect(fitz.Rect(28, 28, 1162, 814))
         shape.finish(color=(0.05, 0.1, 0.25), width=1.0)
 
-        # 2. 左側に2Dコンベア駆動ユニット組立図（正面図・平面図・バルーン）を描画
-        # ベースフレーム
-        shape.draw_rect(fitz.Rect(90, 440, 560, 470))
-        shape.draw_rect(fitz.Rect(110, 470, 145, 680))
-        shape.draw_rect(fitz.Rect(505, 470, 540, 680))
-        shape.draw_rect(fitz.Rect(95, 680, 160, 695))
-        shape.draw_rect(fitz.Rect(490, 680, 555, 695))
-        # サイドプレート＆コンベアフレーム
-        shape.draw_rect(fitz.Rect(100, 320, 550, 440))
-        shape.finish(color=(0.1, 0.2, 0.45), width=1.6)
-
-        # ドライブシャフト・プーリ（左右の円）
-        shape.draw_circle(fitz.Point(155, 380), 42)
-        shape.draw_circle(fitz.Point(155, 380), 16)
-        shape.draw_circle(fitz.Point(495, 380), 38)
-        shape.draw_circle(fitz.Point(495, 380), 14)
-        shape.finish(color=(0.05, 0.35, 0.75), width=1.8)
-
-        # 平面図（上段）
-        shape.draw_rect(fitz.Rect(100, 110, 550, 250))
-        shape.draw_rect(fitz.Rect(100, 110, 550, 125))
-        shape.draw_rect(fitz.Rect(100, 235, 550, 250))
-        shape.draw_rect(fitz.Rect(135, 70, 175, 290))
-        shape.draw_rect(fitz.Rect(475, 95, 515, 265))
-        # モータユニット
-        shape.draw_rect(fitz.Rect(115, 45, 220, 70))
+        # 2D組立図（正面図・平面図）
+        for r in [(90, 440, 560, 470), (110, 470, 145, 680), (505, 470, 540, 680), (100, 320, 550, 440), (100, 110, 550, 250), (135, 70, 175, 290), (475, 95, 515, 265), (115, 45, 220, 70)]:
+            shape.draw_rect(fitz.Rect(*r))
         shape.finish(color=(0.1, 0.2, 0.45), width=1.5)
 
-        # 中心線（一点鎖線風）
-        shape.draw_line(fitz.Point(75, 380), fitz.Point(575, 380))
-        shape.draw_line(fitz.Point(155, 310), fitz.Point(155, 450))
-        shape.draw_line(fitz.Point(495, 310), fitz.Point(495, 450))
-        shape.draw_line(fitz.Point(75, 180), fitz.Point(575, 180))
-        shape.finish(color=(0.8, 0.2, 0.2), width=0.7, dashes="[8 3 2 3] 0")
+        for cx, cy, rad in [(155, 380, 42), (155, 380, 16), (495, 380, 38), (495, 380, 14)]:
+            shape.draw_circle(fitz.Point(cx, cy), rad)
+        shape.finish(color=(0.05, 0.35, 0.75), width=1.8)
 
-        # バルーン（部品番号引き出し線と丸囲み）
-        balloons = [
-            (260, 455, 220, 530, "1"),
-            (155, 364, 80, 295, "2"),
-            (495, 366, 575, 295, "3"),
-            (320, 320, 350, 275, "4"),
-            (320, 110, 360, 65, "6"),
-            (155, 110, 85, 65, "9"),
-            (190, 55, 270, 55, "11"),
-        ]
-        for bx0, by0, bx1, by1, b_num in balloons:
-            shape.draw_line(fitz.Point(bx0, by0), fitz.Point(bx1, by1))
-            shape.draw_circle(fitz.Point(bx1, by1), 13)
-        shape.finish(color=(0.15, 0.4, 0.2), width=1.1)
-
-        # 3. 右上に部品表テーブル (X: 600〜1150, Y: 45〜465) を描画
-        tx0, ty0, tx1 = 595, 45, 1152
-        col_widths = [32, 82, 115, 92, 55, 88, 32, 30, 31]  # 合計557
-        row_h = 26
+        # 部品表グリッド
+        tx0, ty0, tx1, row_h = 595, 45, 1152, 26
+        col_widths = [32, 82, 115, 92, 55, 88, 32, 30, 31]
         num_rows = len(cls.SAMPLE_BOM_ROWS_PDF)
         ty1 = ty0 + num_rows * row_h
 
-        # ヘッダー背景塗りつぶし
         shape.draw_rect(fitz.Rect(tx0, ty0, tx1, ty0 + row_h))
         shape.finish(color=(0.1, 0.2, 0.4), fill=(0.88, 0.93, 0.98), width=1.2)
 
-        # 横罫線
         for r_i in range(num_rows + 1):
-            y_pos = ty0 + r_i * row_h
-            shape.draw_line(fitz.Point(tx0, y_pos), fitz.Point(tx1, y_pos))
-        # 縦罫線
+            shape.draw_line(fitz.Point(tx0, ty0 + r_i * row_h), fitz.Point(tx1, ty0 + r_i * row_h))
         cur_x = tx0
-        col_x_positions = [cur_x]
+        col_xs = [cur_x]
         for cw in col_widths[:-1]:
             cur_x += cw
-            col_x_positions.append(cur_x)
+            col_xs.append(cur_x)
             shape.draw_line(fitz.Point(cur_x, ty0), fitz.Point(cur_x, ty1))
-        col_x_positions.append(tx1)
+        col_xs.append(tx1)
         shape.draw_rect(fitz.Rect(tx0, ty0, tx1, ty1))
+        shape.draw_rect(fitz.Rect(720, 700, 1152, 806))
         shape.finish(color=(0.1, 0.15, 0.25), width=1.0)
-
-        # 4. 右下に表題欄 (Title Block) を描画
-        tb_x0, tb_y0, tb_x1, tb_y1 = 720, 700, 1152, 806
-        shape.draw_rect(fitz.Rect(tb_x0, tb_y0, tb_x1, tb_y1))
-        shape.draw_line(fitz.Point(tb_x0, 735), fitz.Point(tb_x1, 735))
-        shape.draw_line(fitz.Point(tb_x0, 770), fitz.Point(tb_x1, 770))
-        shape.draw_line(fitz.Point(840, tb_y0), fitz.Point(840, tb_y1))
-        shape.finish(color=(0.1, 0.15, 0.25), width=1.2)
-
         shape.commit()
 
-        # 日本語テキスト書き込み (PyMuPDF内蔵CMap/CJKフォント 'japan' を使用)
-        fontname = "japan"
-        # バルーン番号
-        for _, _, bx1, by1, b_num in balloons:
-            page.insert_text(fitz.Point(bx1 - 4, by1 + 4), b_num, fontname=fontname, fontsize=10, color=(0.1, 0.3, 0.1))
+        fn = "japan"
+        page.insert_text(fitz.Point(240, 298), "【平面図 (TOP VIEW)】", fontname=fn, fontsize=11, color=(0.1, 0.2, 0.4))
+        page.insert_text(fitz.Point(210, 725), "【正面図 (FRONT VIEW) - 全長 600mm × 全高 420mm】", fontname=fn, fontsize=11, color=(0.1, 0.2, 0.4))
 
-        # 図面見出し・寸法テキスト
-        page.insert_text(fitz.Point(250, 298), "【平面図 (TOP VIEW)】", fontname=fontname, fontsize=11, color=(0.1, 0.2, 0.4))
-        page.insert_text(fitz.Point(250, 725), "【正面図 (FRONT VIEW) - 全長 600mm × 全高 420mm】", fontname=fontname, fontsize=11, color=(0.1, 0.2, 0.4))
+        for r_idx, r_vals in enumerate(cls.SAMPLE_BOM_ROWS_PDF):
+            y_t = ty0 + r_idx * row_h + 17
+            disp = [r_vals[0], r_vals[1], r_vals[2], r_vals[3], r_vals[4], r_vals[5], r_vals[6], r_vals[8], r_vals[9]]
+            for c_idx, cell_s in enumerate(disp):
+                page.insert_text(fitz.Point(col_xs[c_idx] + 4, y_t), cell_s, fontname=fn, fontsize=8.2, color=(0.05, 0.08, 0.15))
 
-        # 部品表セル文字列の書き込み
-        for r_idx, row_vals in enumerate(cls.SAMPLE_BOM_ROWS_PDF):
-            y_text = ty0 + r_idx * row_h + 17
-            # 10列あるうちの先頭9列（または備考を結合）
-            display_vals = [
-                row_vals[0],
-                row_vals[1],
-                row_vals[2],
-                row_vals[3],
-                row_vals[4],
-                row_vals[5],
-                row_vals[6],
-                row_vals[8],
-                row_vals[9],
-            ]
-            for c_idx, cell_str in enumerate(display_vals):
-                x_text = col_x_positions[c_idx] + 4
-                page.insert_text(
-                    fitz.Point(x_text, y_text),
-                    cell_str,
-                    fontname=fontname,
-                    fontsize=8.2 if r_idx > 0 else 8.5,
-                    color=(0.05, 0.08, 0.15),
-                )
-
-        # 表題欄テキスト
-        page.insert_text(fitz.Point(730, 722), "図面名称", fontname=fontname, fontsize=10, color=(0.2, 0.2, 0.3))
-        page.insert_text(fitz.Point(855, 722), "ベルトコンベア駆動ユニット組立図", fontname=fontname, fontsize=12, color=(0.05, 0.1, 0.25))
-        page.insert_text(fitz.Point(730, 757), "図面番号", fontname=fontname, fontsize=10, color=(0.2, 0.2, 0.3))
-        page.insert_text(fitz.Point(855, 757), "CV-1001-ASM", fontname=fontname, fontsize=11, color=(0.05, 0.1, 0.25))
-        page.insert_text(fitz.Point(730, 792), "尺度 / 設計", fontname=fontname, fontsize=10, color=(0.2, 0.2, 0.3))
-        page.insert_text(fitz.Point(855, 792), "SCALE 1:5   設計: PartLens技術部", fontname=fontname, fontsize=10, color=(0.05, 0.1, 0.25))
-
+        page.insert_text(fitz.Point(735, 725), "図面名称", fontname=fn, fontsize=10)
+        page.insert_text(fitz.Point(850, 725), "ベルトコンベア駆動ユニット組立図", fontname=fn, fontsize=12)
+        page.insert_text(fitz.Point(735, 760), "図面番号", fontname=fn, fontsize=10)
+        page.insert_text(fitz.Point(850, 760), "CV-1001-ASM", fontname=fn, fontsize=11)
         doc.save(output_path)
         doc.close()
         return output_path
 
     @classmethod
     def create_sample_dxf(cls, output_path: str) -> str:
-        """2D CAD (DXF) のサンプル図面（クランプブラケット組図＋部品欄）を生成する"""
         doc = ezdxf.new("R2010")
         msp = doc.modelspace()
-
-        # 外枠 (0,0) - (420, 297) A3相当
         msp.add_lwpolyline([(0, 0), (420, 0), (420, 297), (0, 297), (0, 0)], close=True)
         msp.add_lwpolyline([(5, 5), (415, 5), (415, 292), (5, 292), (5, 5)], close=True)
-
-        # 左側にブラケット形状を描画
         msp.add_lwpolyline([(30, 60), (190, 60), (190, 85), (30, 85), (30, 60)], close=True)
         msp.add_lwpolyline([(60, 85), (95, 85), (95, 210), (60, 210), (60, 85)], close=True)
         msp.add_lwpolyline([(125, 85), (160, 85), (160, 210), (125, 210), (125, 85)], close=True)
         msp.add_circle((77.5, 175), 12)
         msp.add_circle((142.5, 175), 12)
-        msp.add_circle((50, 72.5), 6)
-        msp.add_circle((170, 72.5), 6)
 
-        # 右上に部品表 (X: 205〜410, Y: 280から下へ)
         headers = ["No", "図番", "品名", "寸法", "材質", "表面処理", "数量", "単重", "備考"]
         col_xs = [208, 220, 255, 295, 330, 355, 385, 396, 405]
         top_y = 278.0
-        row_step = 10.0
-
-        # ヘッダー行
-        msp.add_line((205, top_y + 4), (412, top_y + 4))
         for c_x, h_txt in zip(col_xs, headers):
-            t_ent = msp.add_text(h_txt, dxfattribs={"height": 3.0})
-            t_ent.dxf.insert = (c_x, top_y - 3)
-        msp.add_line((205, top_y - 5), (412, top_y - 5))
-
-        # データ行
+            t_e = msp.add_text(h_txt, dxfattribs={"height": 3.0})
+            t_e.dxf.insert = (c_x, top_y - 3)
         for r_idx, r_vals in enumerate(cls.SAMPLE_BOM_ROWS_DXF, start=1):
-            ry = top_y - 5 - r_idx * row_step
-            for c_x, val_str in zip(col_xs, r_vals):
-                t_ent = msp.add_text(val_str, dxfattribs={"height": 2.8})
-                t_ent.dxf.insert = (c_x, ry + 2)
-            msp.add_line((205, ry), (412, ry))
-
-        # 表題欄
-        msp.add_lwpolyline([(260, 5), (415, 5), (415, 45), (260, 45), (260, 5)], close=True)
+            ry = top_y - 5 - r_idx * 10.0
+            for c_x, val_s in zip(col_xs, r_vals):
+                t_e = msp.add_text(val_s, dxfattribs={"height": 2.8})
+                t_e.dxf.insert = (c_x, ry + 2)
         t1 = msp.add_text("図面名称", dxfattribs={"height": 3.2})
         t1.dxf.insert = (265, 32)
         t2 = msp.add_text("クランプブラケットユニット組図", dxfattribs={"height": 4.0})
         t2.dxf.insert = (300, 32)
         t3 = msp.add_text("BRK-200-ASM", dxfattribs={"height": 3.5})
         t3.dxf.insert = (300, 15)
-
         doc.saveas(output_path)
         return output_path
 
@@ -1656,100 +2230,85 @@ class SampleDrawingGenerator:
 
 @dataclass
 class ExcelExportConfig:
-    """Excel出力時のカスタマイズ設定"""
-    template_type: str = "standard"       # "standard", "purchasing", "manufacturing"
-    split_by_drawing: bool = True         # 複数図面時に図面別シートも作成するか
-    merge_duplicates: bool = False        # 出力時に同一部品を名寄せ合算するか
-    include_preview_sheet: bool = True    # 図面プレビュー画像シートを添付するか
+    template_type: str = "standard"
+    split_by_drawing: bool = True
+    merge_duplicates: bool = False
+    include_preview_sheet: bool = True
     project_name: str = ""
     drawing_no: str = ""
     author_name: str = ""
-    company_name: str = ""
 
 
 class ExcelBOMExporter:
-    """openpyxlを用いて実務品質のExcel部品表(.xlsx)を生成するエクスポーター"""
-
     @classmethod
     def export_to_excel(
-        cls,
-        output_path: str,
-        parts: List[PartItem],
-        documents: List[DrawingDocument],
-        config: ExcelExportConfig,
+        cls, output_path: str, parts: List[PartItem], documents: List[DrawingDocument], config: ExcelExportConfig
     ) -> None:
         wb = openpyxl.Workbook()
-        # デフォルトシートをメインの部品表として使用
         ws_main = wb.active
         ws_main.title = "部品表(BOM)"
 
-        target_parts = copy.deepcopy(parts)
-        if config.merge_duplicates:
-            target_parts = cls.merge_duplicate_parts(target_parts)
+        target_parts = cls.merge_duplicate_parts(copy.deepcopy(parts)) if config.merge_duplicates else copy.deepcopy(parts)
+        cls._populate_bom_worksheet(ws_main, target_parts, config, "総合部品表 (ALL PARTS)")
 
-        cls._populate_bom_worksheet(
-            ws_main,
-            target_parts,
-            config,
-            sheet_subtitle="総合部品表 (ALL PARTS)",
-        )
+        # フォーマット種別に応じた専用手配シートの自動作成
+        if config.template_type == "purchasing":
+            purch_parts = [copy.deepcopy(p) for p in target_parts if p.category in ("購入品", "標準部品", "支給品")]
+            if purch_parts:
+                for idx_p, pp in enumerate(purch_parts, start=1):
+                    pp.item_no = str(idx_p)
+                ws_p = wb.create_sheet(title="購買・標準品手配表")
+                cls._populate_bom_worksheet(ws_p, purch_parts, config, "購入品・標準部品 集計リスト")
+        elif config.template_type == "manufacturing":
+            mfg_parts = [copy.deepcopy(p) for p in target_parts if p.category in ("加工品", "板金品", "製缶・溶接品", "組立品")]
+            if mfg_parts:
+                for idx_m, mp in enumerate(mfg_parts, start=1):
+                    mp.item_no = str(idx_m)
+                ws_m = wb.create_sheet(title="加工・製作手配表")
+                cls._populate_bom_worksheet(ws_m, mfg_parts, config, "加工品・板金・製缶 製作リスト")
 
-        # 複数図面がある場合の図面別シート出力
         if config.split_by_drawing and len(documents) >= 1:
             grouped: Dict[str, List[PartItem]] = {}
             for p in parts:
-                key = p.source_file if p.source_file else "手入力部品"
-                grouped.setdefault(key, []).append(p)
-
+                grouped.setdefault(p.source_file or "手入力部品", []).append(p)
             if len(grouped) > 1:
                 for idx, (src_name, sub_parts) in enumerate(grouped.items(), start=1):
-                    safe_title = re.sub(r"[\\/*?:\[\]]", "_", os.path.splitext(src_name)[0])[:24]
-                    sheet_name = f"{idx}_{safe_title}"
-                    ws_sub = wb.create_sheet(title=sheet_name)
-                    cls._populate_bom_worksheet(
-                        ws_sub,
-                        sub_parts,
-                        config,
-                        sheet_subtitle=f"図面別部品表: {src_name}",
-                    )
+                    safe = re.sub(r"[\\/*?:\[\]]", "_", os.path.splitext(src_name)[0])[:22]
+                    base_title = f"{idx}_{safe}"
+                    sheet_title = base_title[:31]
+                    suffix = 2
+                    while sheet_title in wb.sheetnames:
+                        sheet_title = f"{base_title[:27]}_{suffix}"
+                        suffix += 1
+                    ws_sub = wb.create_sheet(title=sheet_title)
+                    cls._populate_bom_worksheet(ws_sub, copy.deepcopy(sub_parts), config, f"図面別部品表: {src_name}")
 
-        # 図面プレビュー画像シートの添付
-        temp_img_paths: List[str] = []
+        temp_imgs: List[str] = []
         if config.include_preview_sheet and documents:
             ws_prev = wb.create_sheet(title="図面プレビュー")
-            ws_prev.views.sheetView[0].showGridLines = True
             ws_prev["A1"] = "収録2D図面プレビュー一覧"
             ws_prev["A1"].font = Font(name="Meiryo UI", size=14, bold=True, color="1E3A8A")
-
             cur_row = 3
             for doc in documents:
                 for pg in doc.pages:
                     if pg.preview_image is not None:
-                        ws_prev.cell(
-                            row=cur_row, column=1,
-                            value=f"■ ファイル: {doc.file_name} (Page {pg.page_no})  {doc.drawing_title}"
-                        ).font = Font(name="Meiryo UI", size=11, bold=True, color="0F172A")
+                        ws_prev.cell(row=cur_row, column=1, value=f"■ {doc.file_name} (Page {pg.page_no}) {doc.drawing_title}").font = Font(name="Meiryo UI", size=11, bold=True)
                         cur_row += 1
-
                         try:
                             thumb = pg.preview_image.copy()
-                            thumb.thumbnail((920, 620), Image.Resampling.LANCZOS)
-                            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".png")
-                            os.close(tmp_fd)
-                            thumb.save(tmp_path, format="PNG")
-                            temp_img_paths.append(tmp_path)
-
-                            xl_img = OpenpyxlImage(tmp_path)
-                            ws_prev.add_image(xl_img, f"A{cur_row}")
-                            rows_occupied = int(thumb.height / 19) + 3
-                            cur_row += rows_occupied
+                            thumb.thumbnail((900, 600), Image.Resampling.LANCZOS)
+                            fd, tp = tempfile.mkstemp(suffix=".png")
+                            os.close(fd)
+                            thumb.save(tp, format="PNG")
+                            temp_imgs.append(tp)
+                            ws_prev.add_image(OpenpyxlImage(tp), f"A{cur_row}")
+                            cur_row += int(thumb.height / 19) + 3
                         except Exception:
                             cur_row += 2
-
         try:
             wb.save(output_path)
         finally:
-            for tp in temp_img_paths:
+            for tp in temp_imgs:
                 if os.path.exists(tp):
                     try:
                         os.remove(tp)
@@ -1758,249 +2317,550 @@ class ExcelBOMExporter:
 
     @classmethod
     def merge_duplicate_parts(cls, parts: List[PartItem]) -> List[PartItem]:
-        """同一図番・品名・仕様・材質の部品を名寄せし数量を合算する"""
-        merged_map: Dict[Tuple[str, str, str, str], PartItem] = {}
+        merged: Dict[Tuple[str, str, str, str], PartItem] = {}
         for p in parts:
-            key = (
-                p.part_number.strip().upper(),
-                p.part_name.strip(),
-                p.specification.strip().upper(),
-                p.material.strip().upper(),
-            )
-            if key in merged_map:
-                existing = merged_map[key]
-                existing.quantity += p.quantity
-                if p.source_file and p.source_file not in existing.source_file:
-                    existing.source_file = f"{existing.source_file}, {p.source_file}"
-                if p.remarks and p.remarks not in existing.remarks:
-                    existing.remarks = f"{existing.remarks} / {p.remarks}".strip(" /")
+            key = (p.part_number.strip().upper(), p.part_name.strip(), p.specification.strip().upper(), p.material.strip().upper())
+            if key in merged:
+                ex = merged[key]
+                ex.quantity += p.quantity
+                if p.source_file and p.source_file not in ex.source_file:
+                    ex.source_file = f"{ex.source_file}, {p.source_file}"
             else:
-                merged_map[key] = copy.deepcopy(p)
-
-        result = list(merged_map.values())
-        for idx, item in enumerate(result, start=1):
+                merged[key] = copy.deepcopy(p)
+        res = list(merged.values())
+        for idx, item in enumerate(res, start=1):
             item.item_no = str(idx)
-        return result
+        return res
 
     @classmethod
-    def _populate_bom_worksheet(
-        cls,
-        ws: Any,
-        parts: List[PartItem],
-        config: ExcelExportConfig,
-        sheet_subtitle: str,
-    ) -> None:
-        """ワークシートに美しいヘッダー・罫線・数式・書式付きの部品表を書き込む"""
-        font_family = "Meiryo UI"
-
-        # テンプレート別のタイトル定義
-        template_titles = {
+    def _populate_bom_worksheet(cls, ws: Any, parts: List[PartItem], config: ExcelExportConfig, subtitle: str) -> None:
+        ff = "Meiryo UI"
+        titles = {
             "standard": "部 品 表 (BILL OF MATERIALS)",
             "purchasing": "購買・手配部品リスト (PURCHASING BOM)",
             "manufacturing": "加工・製造部品リスト (MANUFACTURING BOM)",
         }
-        main_title = template_titles.get(config.template_type, "部 品 表 (BILL OF MATERIALS)")
+        thin = Side(style="thin", color="CBD5E1")
+        med = Side(style="medium", color="1E3A8A")
+        dbl = Side(style="double", color="1E3A8A")
+        b_cell = Border(left=thin, right=thin, top=thin, bottom=thin)
+        b_head = Border(left=thin, right=thin, top=med, bottom=med)
+        b_tot = Border(left=thin, right=thin, top=med, bottom=dbl)
 
-        # スタイル定義
-        title_font = Font(name=font_family, size=16, bold=True, color="FFFFFF")
-        title_fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
-
-        meta_label_font = Font(name=font_family, size=9, bold=True, color="1E293B")
-        meta_label_fill = PatternFill(start_color="E2E8F0", end_color="E2E8F0", fill_type="solid")
-        meta_val_font = Font(name=font_family, size=10, bold=False, color="0F172A")
-
-        header_font = Font(name=font_family, size=10, bold=True, color="FFFFFF")
-        header_fill = PatternFill(start_color="1E40AF", end_color="1E40AF", fill_type="solid")
-
-        data_font = Font(name=font_family, size=10, color="0F172A")
-        data_font_bold = Font(name=font_family, size=10, bold=True, color="0F172A")
-        even_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
-        odd_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
-        calc_fill = PatternFill(start_color="EFF6FF", end_color="EFF6FF", fill_type="solid")
-
-        total_font = Font(name=font_family, size=10, bold=True, color="1E3A8A")
-        total_fill = PatternFill(start_color="DBEAFE", end_color="DBEAFE", fill_type="solid")
-
-        thin_side = Side(style="thin", color="CBD5E1")
-        med_side = Side(style="medium", color="1E3A8A")
-        double_side = Side(style="double", color="1E3A8A")
-
-        cell_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
-        header_border = Border(left=thin_side, right=thin_side, top=med_side, bottom=med_side)
-        total_border = Border(left=thin_side, right=thin_side, top=med_side, bottom=double_side)
-
-        # 1. タイトルバナー (1行目)
         total_cols = 15
         ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=total_cols)
-        title_cell = ws.cell(row=1, column=1, value=main_title)
-        title_cell.font = title_font
-        title_cell.fill = title_fill
-        title_cell.alignment = Alignment(horizontal="center", vertical="center")
-        ws.row_dimensions[1].height = 32
+        tc = ws.cell(row=1, column=1, value=titles.get(config.template_type, titles["standard"]))
+        tc.font = Font(name=ff, size=15, bold=True, color="FFFFFF")
+        tc.fill = PatternFill("solid", fgColor="1E3A8A")
+        tc.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 30
 
-        # 2. プロジェクト・図面メタデータ欄 (2〜3行目)
-        today_str = datetime.date.today().strftime("%Y-%m-%d")
-        meta_items = [
+        today_s = datetime.date.today().strftime("%Y-%m-%d")
+        metas = [
             (2, 1, "案件・製品名", 2, 2, config.project_name or "未設定", 4),
             (2, 5, "総合図番", 2, 6, config.drawing_no or "-", 8),
             (2, 9, "作成者", 2, 10, config.author_name or "-", 11),
-            (2, 12, "出力日", 2, 13, today_str, 15),
-            (3, 1, "シート区分", 3, 2, sheet_subtitle, 8),
+            (2, 12, "出力日", 2, 13, today_s, 15),
+            (3, 1, "シート区分", 3, 2, subtitle, 8),
             (3, 9, "総部品行数", 3, 10, f"{len(parts)} 件", 11),
-            (3, 12, "作成システム", 3, 13, APP_NAME, 15),
+            (3, 12, "システム", 3, 13, APP_NAME, 15),
         ]
-        for r_idx in (2, 3):
-            ws.row_dimensions[r_idx].height = 20
+        for r_i in (2, 3):
+            ws.row_dimensions[r_i].height = 20
             for c_i in range(1, total_cols + 1):
-                ws.cell(row=r_idx, column=c_i).border = cell_border
+                ws.cell(row=r_i, column=c_i).border = b_cell
+        for lr, lc, lt, vr, vc, vt, vce in metas:
+            lc_cell = ws.cell(row=lr, column=lc, value=lt)
+            lc_cell.font = Font(name=ff, size=9, bold=True, color="1E293B")
+            lc_cell.fill = PatternFill("solid", fgColor="E2E8F0")
+            lc_cell.alignment = Alignment(horizontal="center", vertical="center")
+            if vce > vc:
+                ws.merge_cells(start_row=vr, start_column=vc, end_row=vr, end_column=vce)
+            vc_cell = ws.cell(row=vr, column=vc, value=vt)
+            vc_cell.font = Font(name=ff, size=10, color="0F172A")
+            vc_cell.alignment = Alignment(horizontal="left", vertical="center")
 
-        for lr, lc, l_text, vr, vc, v_text, vc_end in meta_items:
-            l_cell = ws.cell(row=lr, column=lc, value=l_text)
-            l_cell.font = meta_label_font
-            l_cell.fill = meta_label_fill
-            l_cell.alignment = Alignment(horizontal="center", vertical="center")
-
-            if vc_end > vc:
-                ws.merge_cells(start_row=vr, start_column=vc, end_row=vr, end_column=vc_end)
-            v_cell = ws.cell(row=vr, column=vc, value=v_text)
-            v_cell.font = meta_val_font
-            v_cell.alignment = Alignment(horizontal="left", vertical="center")
-
-        # 4行目は空行スペーサー
-        ws.row_dimensions[4].height = 8
-
-        # 5行目: テーブル列ヘッダー
         headers = [
-            ("No.", 6, "center"),
-            ("図番 / 品番", 18, "left"),
-            ("品名 / 部品名称", 24, "left"),
-            ("型式・寸法・仕様", 22, "left"),
-            ("材質", 13, "center"),
-            ("表面処理・熱処理", 18, "left"),
-            ("数量", 9, "right"),
-            ("単位", 7, "center"),
-            ("単重(kg)", 11, "right"),
-            ("総重量(kg)", 12, "right"),
-            ("調達区分", 12, "center"),
-            ("メーカー / 手配先", 16, "left"),
-            ("単価(円)", 12, "right"),
-            ("金額(円)", 14, "right"),
-            ("抽出元図面 / 備考", 26, "left"),
+            ("No.", 6, "center"), ("図番 / 品番", 18, "left"), ("品名 / 部品名称", 24, "left"),
+            ("型式・寸法・仕様", 22, "left"), ("材質", 13, "center"), ("表面処理・熱処理", 18, "left"),
+            ("数量", 9, "right"), ("単位", 7, "center"), ("単重(kg)", 11, "right"),
+            ("総重量(kg)", 12, "right"), ("調達区分", 12, "center"), ("メーカー", 16, "left"),
+            ("単価(円)", 12, "right"), ("金額(円)", 14, "right"), ("抽出元図面 / 備考", 26, "left"),
         ]
+        h_row = 5
+        ws.row_dimensions[h_row].height = 25
+        for c_idx, (ht, cw, _) in enumerate(headers, start=1):
+            c = ws.cell(row=h_row, column=c_idx, value=ht)
+            c.font = Font(name=ff, size=10, bold=True, color="FFFFFF")
+            c.fill = PatternFill("solid", fgColor="1E40AF")
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            c.border = b_head
+            ws.column_dimensions[get_column_letter(c_idx)].width = cw
 
-        header_row = 5
-        ws.row_dimensions[header_row].height = 26
-        for col_idx, (h_text, col_w, _) in enumerate(headers, start=1):
-            c = ws.cell(row=header_row, column=col_idx, value=h_text)
-            c.font = header_font
-            c.fill = header_fill
-            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            c.border = header_border
-            ws.column_dimensions[get_column_letter(col_idx)].width = col_w
-
-        # 6行目以降: データ行
-        start_data_row = 6
+        s_row = 6
         for idx, p in enumerate(parts):
-            r = start_data_row + idx
+            r = s_row + idx
             ws.row_dimensions[r].height = 22
-            row_fill = even_fill if idx % 2 == 0 else odd_fill
-
-            remark_combined = p.remarks
-            if p.source_file:
-                remark_combined = f"[{p.source_file}] {p.remarks}".strip()
-
-            # Excel数式: J列(総重量) = G列(数量) * I列(単重), N列(金額) = G列(数量) * M列(単価)
-            weight_formula = f"=G{r}*I{r}"
-            amount_formula = f"=G{r}*M{r}"
-
-            row_values = [
+            rf = PatternFill("solid", fgColor="FFFFFF" if idx % 2 == 0 else "F8FAFC")
+            cf = PatternFill("solid", fgColor="EFF6FF")
+            rem = f"[{p.source_file}] {p.remarks}".strip() if p.source_file else p.remarks
+            vals = [
                 int(p.item_no) if p.item_no.isdigit() else p.item_no,
-                p.part_number,
-                p.part_name,
-                p.specification,
-                p.material,
-                p.treatment,
-                p.quantity,
-                p.unit,
-                p.unit_weight,
-                weight_formula,
-                p.category,
-                p.manufacturer,
-                p.unit_price,
-                amount_formula,
-                remark_combined,
+                p.part_number, p.part_name, p.specification, p.material, p.treatment,
+                p.quantity, p.unit, p.unit_weight, f"=G{r}*I{r}",
+                p.category, p.manufacturer, p.unit_price, f"=G{r}*M{r}", rem,
             ]
-
-            for col_idx, val in enumerate(row_values, start=1):
-                cell = ws.cell(row=r, column=col_idx, value=val)
-                cell.font = data_font_bold if col_idx in (3, 10, 14) else data_font
-                cell.fill = calc_fill if col_idx in (10, 14) else row_fill
-                cell.border = cell_border
-                align_h = headers[col_idx - 1][2]
-                cell.alignment = Alignment(horizontal=align_h, vertical="center")
-
-                # 数値フォーマット
-                if col_idx == 7:
+            for c_idx, val in enumerate(vals, start=1):
+                cell = ws.cell(row=r, column=c_idx, value=val)
+                cell.font = Font(name=ff, size=10, bold=(c_idx in (3, 10, 14)), color="0F172A")
+                cell.fill = cf if c_idx in (10, 14) else rf
+                cell.border = b_cell
+                cell.alignment = Alignment(horizontal=headers[c_idx - 1][2], vertical="center")
+                if c_idx == 7:
                     cell.number_format = "#,##0.##"
-                elif col_idx in (9, 10):
+                elif c_idx in (9, 10):
                     cell.number_format = "0.000"
-                elif col_idx in (13, 14):
+                elif c_idx in (13, 14):
                     cell.number_format = "#,##0"
 
-        # 末尾: 合計(SUM)集計行
-        end_data_row = max(start_data_row + len(parts) - 1, start_data_row)
-        total_row = start_data_row + len(parts)
-        ws.row_dimensions[total_row].height = 25
-
-        for col_idx in range(1, total_cols + 1):
-            c = ws.cell(row=total_row, column=col_idx, value="")
-            c.font = total_font
-            c.fill = total_fill
-            c.border = total_border
+        e_row = max(s_row + len(parts) - 1, s_row)
+        t_row = s_row + len(parts)
+        ws.row_dimensions[t_row].height = 25
+        for c_idx in range(1, total_cols + 1):
+            c = ws.cell(row=t_row, column=c_idx, value="")
+            c.font = Font(name=ff, size=10, bold=True, color="1E3A8A")
+            c.fill = PatternFill("solid", fgColor="DBEAFE")
+            c.border = b_tot
             c.alignment = Alignment(horizontal="right", vertical="center")
-
-        ws.cell(row=total_row, column=3, value="合 計 (TOTAL)").alignment = Alignment(
-            horizontal="center", vertical="center"
-        )
+        ws.cell(row=t_row, column=3, value="合 計 (TOTAL)").alignment = Alignment(horizontal="center", vertical="center")
         if parts:
-            c_qty = ws.cell(row=total_row, column=7, value=f"=SUM(G{start_data_row}:G{end_data_row})")
-            c_qty.number_format = "#,##0.##"
+            ws.cell(row=t_row, column=7, value=f"=SUM(G{s_row}:G{e_row})").number_format = "#,##0.##"
+            ws.cell(row=t_row, column=10, value=f"=SUM(J{s_row}:J{e_row})").number_format = "0.000"
+            ws.cell(row=t_row, column=14, value=f"=SUM(N{s_row}:N{e_row})").number_format = "#,##0"
 
-            c_wt = ws.cell(row=total_row, column=10, value=f"=SUM(J{start_data_row}:J{end_data_row})")
-            c_wt.number_format = "0.000"
-
-            c_amt = ws.cell(row=total_row, column=14, value=f"=SUM(N{start_data_row}:N{end_data_row})")
-            c_amt.number_format = "#,##0"
-
-        # テンプレートに応じた不要列の非表示最適化
-        if config.template_type == "purchasing":
-            ws.column_dimensions["F"].hidden = True
-            ws.column_dimensions["I"].hidden = True
-        elif config.template_type == "manufacturing":
-            ws.column_dimensions["M"].hidden = True
-            ws.column_dimensions["N"].hidden = True
-
-        # オートフィルタ・ウィンドウ枠固定・A4横1ページ幅印刷設定
-        ws.auto_filter.ref = f"A{header_row}:O{total_row}"
-        ws.freeze_panes = f"A{start_data_row}"
+        ws.auto_filter.ref = f"A{h_row}:O{t_row}"
+        ws.freeze_panes = f"A{s_row}"
         ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
         ws.page_setup.paperSize = ws.PAPERSIZE_A4
-        ws.sheet_properties.pageSetUpPr.fitToPage = True
-        ws.page_setup.fitToWidth = 1
-        ws.page_setup.fitToHeight = 0
 
 
 # ==============================================================================
-# サブダイアログ群 (重量計算機 / Excel出力設定 / 使い方ガイド)
+# ダイアログ群 (Gemini AI設定 / 重量計算機 / Excel出力設定 / 使い方ガイド)
 # ==============================================================================
+
+class GeminiSettingsDialog(tk.Toplevel):
+    """Gemini APIキー、最新モデル一覧選択・最適モデル自動選定、AI解析オプション設定ダイアログ"""
+
+    def __init__(self, parent: tk.Misc, config: GeminiConfig, on_save_callback: Any):
+        super().__init__(parent)
+        self.title(f"Gemini AI 高精度解析・モデル選択設定 - {APP_NAME}")
+        self.geometry("820x700")
+        self.minsize(720, 610)
+        self.configure(bg=LightPalette.BG_MAIN)
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+        enforce_windows_light_mode(self)
+
+        self.config_obj = config
+        self.on_save_callback = on_save_callback
+        self.model_entries: List[Dict[str, Any]] = self._build_initial_model_entries()
+        self._is_fetching = False
+        self._is_testing = False
+        self._syncing_selection = False
+        self._build_ui()
+        self._populate_model_tree()
+        self._sync_tree_and_detail_from_model_var()
+
+    def _build_initial_model_entries(self) -> List[Dict[str, Any]]:
+        if self.config_obj.cached_models:
+            return GeminiVisionAnalyzer.merge_catalog_with_api_models(self.config_obj.cached_models)
+        return copy.deepcopy(GEMINI_MODEL_CATALOG)
+
+    def _build_ui(self) -> None:
+        header = tk.Frame(self, bg=LightPalette.BTN_AI_BG, padx=16, pady=10)
+        header.pack(fill=tk.X)
+        tk.Label(
+            header,
+            text="Gemini API マルチモーダル図面解析設定（最新モデル選択対応）",
+            bg=LightPalette.BTN_AI_BG,
+            fg="#FFFFFF",
+            font=("Meiryo UI", 11, "bold"),
+        ).pack(anchor="w")
+
+        body = tk.Frame(self, bg=LightPalette.BG_PANEL, padx=18, pady=12)
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=10)
+
+        # 1. APIキー
+        tk.Label(body, text="1. Gemini APIキー (Google AI Studio):", bg=LightPalette.BG_PANEL, fg=LightPalette.FG_MAIN, font=("Meiryo UI", 9, "bold")).pack(anchor="w")
+        key_row = tk.Frame(body, bg=LightPalette.BG_PANEL)
+        key_row.pack(fill=tk.X, pady=(4, 4))
+
+        self.api_key_var = tk.StringVar(value=self.config_obj.api_key)
+        self.key_entry = ttk.Entry(key_row, textvariable=self.api_key_var, show="●", width=52)
+        self.key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.show_key = False
+        tk.Button(
+            key_row, text="表示/隠す", command=self._toggle_key_vis,
+            bg=LightPalette.BTN_DEFAULT_BG, fg=LightPalette.FG_MAIN, relief=tk.SOLID, bd=1, padx=8, font=("Meiryo UI", 8)
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        self.save_key_var = tk.BooleanVar(value=self.config_obj.save_api_key)
+        ttk.Checkbutton(body, text="APIキーをPC内の設定ファイルに保存する（次回から自動読込）", variable=self.save_key_var).pack(anchor="w", pady=(0, 8))
+
+        # 2. モデル選択セクション（最新一覧＋最適選択＋ライブ取得）
+        tk.Label(
+            body,
+            text="2. 使用する Gemini モデル（一覧クリックで選択 / APIからリアルタイム更新可）:",
+            bg=LightPalette.BG_PANEL,
+            fg=LightPalette.FG_MAIN,
+            font=("Meiryo UI", 9, "bold"),
+        ).pack(anchor="w")
+
+        model_ctrl = tk.Frame(body, bg=LightPalette.BG_PANEL)
+        model_ctrl.pack(fill=tk.X, pady=(4, 6))
+
+        tk.Label(model_ctrl, text="選択モデルID:", bg=LightPalette.BG_PANEL, fg=LightPalette.FG_SUB, font=("Meiryo UI", 8, "bold")).pack(side=tk.LEFT)
+        self.model_var = tk.StringVar(value=strip_gemini_model_prefix(self.config_obj.model_name) or DEFAULT_OPTIMAL_GEMINI_MODEL)
+        self.model_combo = ttk.Combobox(
+            model_ctrl,
+            textvariable=self.model_var,
+            values=[m["id"] for m in self.model_entries],
+            width=26,
+        )
+        self.model_combo.pack(side=tk.LEFT, padx=(4, 8))
+        self.model_combo.bind("<<ComboboxSelected>>", lambda _e: self._sync_tree_and_detail_from_model_var())
+        self.model_var.trace_add("write", lambda *_: self._on_model_var_edited())
+
+        tk.Button(
+            model_ctrl, text="★最適モデル(バランス)", command=lambda: self._apply_optimal_model("balanced"),
+            bg="#EDE9FE", fg="#5B21B6", relief=tk.SOLID, bd=1, padx=7, pady=2, font=("Meiryo UI", 8, "bold"), cursor="hand2"
+        ).pack(side=tk.LEFT, padx=2)
+        tk.Button(
+            model_ctrl, text="精度優先", command=lambda: self._apply_optimal_model("accuracy"),
+            bg="#EFF6FF", fg="#1D4ED8", relief=tk.SOLID, bd=1, padx=7, pady=2, font=("Meiryo UI", 8), cursor="hand2"
+        ).pack(side=tk.LEFT, padx=2)
+        tk.Button(
+            model_ctrl, text="高速・省コスト", command=lambda: self._apply_optimal_model("speed"),
+            bg="#ECFDF5", fg="#047857", relief=tk.SOLID, bd=1, padx=7, pady=2, font=("Meiryo UI", 8), cursor="hand2"
+        ).pack(side=tk.LEFT, padx=2)
+
+        self.btn_fetch_models = tk.Button(
+            model_ctrl,
+            text="APIから最新モデル一覧を取得",
+            command=self._fetch_models_async,
+            bg="#2563EB",
+            fg="#FFFFFF",
+            relief=tk.FLAT,
+            padx=9,
+            pady=3,
+            font=("Meiryo UI", 8, "bold"),
+            cursor="hand2",
+        )
+        self.btn_fetch_models.pack(side=tk.RIGHT)
+
+        # モデル一覧 Treeview
+        tree_wrap = tk.Frame(body, bg=LightPalette.BG_PANEL, bd=1, relief=tk.SOLID)
+        tree_wrap.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+
+        cols = ("tier", "model_id", "display_name", "speed", "accuracy", "pricing", "source")
+        self.model_tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", height=7, selectmode="browse")
+        col_specs = [
+            ("tier", "推奨 / 区分", 130, "w"),
+            ("model_id", "モデルID", 160, "w"),
+            ("display_name", "モデル名", 135, "w"),
+            ("speed", "速度", 78, "center"),
+            ("accuracy", "図面精度", 82, "center"),
+            ("pricing", "料金・無料枠目安", 160, "w"),
+            ("source", "取得元", 92, "center"),
+        ]
+        for cid, heading, w, anchor in col_specs:
+            self.model_tree.heading(cid, text=heading)
+            self.model_tree.column(cid, width=w, minwidth=65, anchor=anchor)
+
+        tree_sb = ttk.Scrollbar(tree_wrap, orient=tk.VERTICAL, command=self.model_tree.yview)
+        self.model_tree.configure(yscrollcommand=tree_sb.set)
+        self.model_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.model_tree.tag_configure("recommended", background="#F5F3FF", foreground="#0F172A")
+        self.model_tree.tag_configure("normal", background="#FFFFFF", foreground="#0F172A")
+        self.model_tree.tag_configure("legacy", background="#F8FAFC", foreground="#64748B")
+
+        self.model_tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.model_tree.bind("<Double-1>", self._on_tree_double_click)
+
+        # 選択中モデルの詳細ボックス
+        detail_box = tk.Frame(body, bg=LightPalette.BG_SUB, bd=1, relief=tk.SOLID, padx=10, pady=6)
+        detail_box.pack(fill=tk.X, pady=(0, 8))
+        self.model_detail_title_lbl = tk.Label(
+            detail_box,
+            text="",
+            bg=LightPalette.BG_SUB,
+            fg=LightPalette.FG_ACCENT,
+            font=("Meiryo UI", 8, "bold"),
+            anchor="w",
+        )
+        self.model_detail_title_lbl.pack(fill=tk.X)
+        self.model_detail_desc_lbl = tk.Label(
+            detail_box,
+            text="",
+            bg=LightPalette.BG_SUB,
+            fg=LightPalette.FG_MAIN,
+            font=("Meiryo UI", 8),
+            anchor="w",
+            justify="left",
+            wraplength=750,
+        )
+        self.model_detail_desc_lbl.pack(fill=tk.X, pady=(2, 0))
+
+        # 3. 動作オプション
+        self.auto_load_var = tk.BooleanVar(value=self.config_obj.auto_use_on_load)
+        ttk.Checkbutton(body, text="図面ファイルを開いたときに自動で Gemini AI 解析を実行する", variable=self.auto_load_var).pack(anchor="w", pady=1)
+
+        self.area_ai_var = tk.BooleanVar(value=self.config_obj.use_for_area_select)
+        ttk.Checkbutton(body, text="マウス範囲選択抽出時に選択エリアの画像を Gemini AI で高精度解析する", variable=self.area_ai_var).pack(anchor="w", pady=1)
+
+        self.replace_var = tk.BooleanVar(value=self.config_obj.replace_existing_on_ai)
+        ttk.Checkbutton(body, text="AI図面解析実行時、対象ページの既存抽出行をAI結果で置き換える", variable=self.replace_var).pack(anchor="w", pady=1)
+
+        # 4. カスタム指示
+        tk.Label(body, text="3. AIへの追加指示（任意: 例「ボルト・ナットは除外」「備考に図面番号を入れる」など）:", bg=LightPalette.BG_PANEL, fg=LightPalette.FG_MAIN, font=("Meiryo UI", 8, "bold")).pack(anchor="w", pady=(6, 2))
+        self.custom_var = tk.StringVar(value=self.config_obj.custom_instruction)
+        ttk.Entry(body, textvariable=self.custom_var, width=72).pack(fill=tk.X, pady=(0, 6))
+
+        # 接続テスト・一覧取得ステータス
+        self.test_status_lbl = tk.Label(body, text="", bg=LightPalette.BG_PANEL, fg=LightPalette.FG_ACCENT, font=("Meiryo UI", 8, "bold"), anchor="w")
+        self.test_status_lbl.pack(fill=tk.X, pady=2)
+
+        btn_bar = tk.Frame(body, bg=LightPalette.BG_PANEL)
+        btn_bar.pack(fill=tk.X, pady=(6, 0))
+
+        self.btn_test_conn = tk.Button(
+            btn_bar, text="接続テスト", command=self._run_test,
+            bg="#EDE9FE", fg="#5B21B6", relief=tk.SOLID, bd=1, padx=12, pady=5, font=("Meiryo UI", 9, "bold"), cursor="hand2"
+        )
+        self.btn_test_conn.pack(side=tk.LEFT)
+
+        tk.Button(
+            btn_bar, text="設定を保存", command=self._save,
+            bg=LightPalette.BTN_PRIMARY_BG, fg=LightPalette.BTN_PRIMARY_FG, relief=tk.FLAT, padx=18, pady=5, font=("Meiryo UI", 9, "bold"), cursor="hand2"
+        ).pack(side=tk.RIGHT, padx=(6, 0))
+
+        tk.Button(
+            btn_bar, text="キャンセル", command=self.destroy,
+            bg=LightPalette.BTN_DEFAULT_BG, fg=LightPalette.BTN_DEFAULT_FG, relief=tk.SOLID, bd=1, padx=12, pady=5, font=("Meiryo UI", 9)
+        ).pack(side=tk.RIGHT)
+
+    def _populate_model_tree(self) -> None:
+        self.model_tree.delete(*self.model_tree.get_children())
+        combo_ids: List[str] = []
+        for idx, m in enumerate(self.model_entries):
+            mid = str(m.get("id", ""))
+            if not mid:
+                continue
+            combo_ids.append(mid)
+            rank = int(m.get("recommended_rank", 50))
+            if m.get("recommended") or rank <= 12:
+                tag = "recommended"
+            elif rank >= 80:
+                tag = "legacy"
+            else:
+                tag = "normal"
+
+            iid = f"m_{idx}"
+            self.model_tree.insert(
+                "",
+                tk.END,
+                iid=iid,
+                values=(
+                    m.get("tier_badge", ""),
+                    mid,
+                    m.get("display_name", mid),
+                    m.get("speed", ""),
+                    m.get("accuracy", ""),
+                    m.get("pricing", ""),
+                    m.get("source", "標準カタログ"),
+                ),
+                tags=(tag,),
+            )
+        if combo_ids:
+            self.model_combo.configure(values=combo_ids)
+
+    def _sync_tree_and_detail_from_model_var(self) -> None:
+        target_id = strip_gemini_model_prefix(self.model_var.get())
+        self._update_model_detail_panel(target_id)
+        if self._syncing_selection:
+            return
+        self._syncing_selection = True
+        try:
+            for iid in self.model_tree.get_children():
+                vals = self.model_tree.item(iid, "values")
+                if vals and len(vals) > 1 and vals[1] == target_id:
+                    self.model_tree.selection_set(iid)
+                    self.model_tree.see(iid)
+                    break
+        finally:
+            self._syncing_selection = False
+
+    def _on_model_var_edited(self) -> None:
+        if self._syncing_selection:
+            return
+        self._sync_tree_and_detail_from_model_var()
+
+    def _on_tree_select(self, _event: Any = None) -> None:
+        if self._syncing_selection:
+            return
+        sel = self.model_tree.selection()
+        if not sel:
+            return
+        vals = self.model_tree.item(sel[0], "values")
+        if vals and len(vals) > 1:
+            mid = str(vals[1]).strip()
+            self._syncing_selection = True
+            try:
+                self.model_var.set(mid)
+                self._update_model_detail_panel(mid)
+            finally:
+                self._syncing_selection = False
+
+    def _on_tree_double_click(self, _event: Any = None) -> None:
+        self._on_tree_select()
+        mid = strip_gemini_model_prefix(self.model_var.get())
+        if mid:
+            self.test_status_lbl.configure(
+                text=f"モデル「{mid}」を選択しました。「設定を保存」で確定します。",
+                fg=LightPalette.FG_ACCENT,
+            )
+
+    def _update_model_detail_panel(self, model_id: str) -> None:
+        entry = get_gemini_model_entry(model_id, self.model_entries)
+        mid = entry.get("id", model_id)
+        badge = entry.get("tier_badge", "")
+        free_info = entry.get("free_tier", "")
+        gen = entry.get("generation", "")
+        in_tok = int(entry.get("input_token_limit", 0) or 0)
+        tok_note = f" / 最大入力: {in_tok:,} tokens" if in_tok > 0 else ""
+        mr_note = " / 高精細図面モード(MEDIA_RESOLUTION_HIGH)対応" if entry.get("supports_media_resolution") else ""
+        self.model_detail_title_lbl.configure(
+            text=f"選択モデル詳細: {mid} ({gen} / {badge} / 無料枠: {free_info}{tok_note}{mr_note})"
+        )
+        self.model_detail_desc_lbl.configure(text=str(entry.get("description", "")))
+
+    def _apply_optimal_model(self, priority: str = "balanced") -> None:
+        best_id = select_optimal_gemini_model(self.model_entries, priority=priority)
+        self.model_var.set(best_id)
+        self._sync_tree_and_detail_from_model_var()
+        label_map = {
+            "balanced": "図面解析バランス最適",
+            "accuracy": "高精度優先最適",
+            "speed": "高速・省コスト最適",
+        }
+        self.test_status_lbl.configure(
+            text=f"「{label_map.get(priority, '最適')}」基準でモデル「{best_id}」を自動選択しました。",
+            fg="#059669",
+        )
+
+    def _fetch_models_async(self) -> None:
+        if self._is_fetching:
+            return
+        api_key = self.api_key_var.get().strip()
+        if not api_key:
+            messagebox.showinfo("APIキー未入力", "APIから最新モデル一覧を取得するには、先に上の欄へ Gemini APIキーを入力してください。", parent=self)
+            return
+
+        self._is_fetching = True
+        self.btn_fetch_models.configure(state=tk.DISABLED, text="取得中...")
+        self.test_status_lbl.configure(text="Gemini API から現在利用可能な最新モデル一覧を取得しています...", fg=LightPalette.FG_SUB)
+        self.update_idletasks()
+
+        def worker() -> None:
+            try:
+                entries = GeminiVisionAnalyzer.fetch_available_models(api_key)
+                self.after(0, lambda e=entries: self._on_fetch_models_done(e, None))
+            except Exception as exc:
+                msg = str(exc)
+                self.after(0, lambda m=msg: self._on_fetch_models_done(None, m))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_fetch_models_done(self, entries: Optional[List[Dict[str, Any]]], err: Optional[str]) -> None:
+        if not self.winfo_exists():
+            return
+        self._is_fetching = False
+        self.btn_fetch_models.configure(state=tk.NORMAL, text="APIから最新モデル一覧を取得")
+        if err or not entries:
+            self.test_status_lbl.configure(text=f"モデル一覧取得エラー: {err or '不明なエラー'}", fg="#DC2626")
+            return
+
+        self.model_entries = entries
+        live_count = sum(1 for m in entries if m.get("source") == "API利用可能")
+        self._populate_model_tree()
+        best_id = select_optimal_gemini_model(entries, priority="balanced")
+        current_id = strip_gemini_model_prefix(self.model_var.get())
+        live_ids = {m["id"] for m in entries if m.get("source") == "API利用可能"}
+        if not current_id or (live_ids and current_id not in live_ids):
+            self.model_var.set(best_id)
+        self._sync_tree_and_detail_from_model_var()
+        self.test_status_lbl.configure(
+            text=f"APIから最新モデル {live_count}件を取得し一覧を更新しました（現在のおすすめ最適モデル: {best_id}）。",
+            fg="#059669",
+        )
+
+    def _toggle_key_vis(self) -> None:
+        self.show_key = not self.show_key
+        self.key_entry.configure(show="" if self.show_key else "●")
+
+    def _run_test(self) -> None:
+        if self._is_testing:
+            return
+        api_key = self.api_key_var.get().strip()
+        if not api_key:
+            self.test_status_lbl.configure(text="APIキーが入力されていません。", fg="#DC2626")
+            return
+        model_id = strip_gemini_model_prefix(self.model_var.get()) or DEFAULT_OPTIMAL_GEMINI_MODEL
+        tmp_cfg = GeminiConfig(api_key=api_key, model_name=model_id)
+        self._is_testing = True
+        self.btn_test_conn.configure(state=tk.DISABLED, text="テスト中...")
+        self.test_status_lbl.configure(text=f"Gemini API ({model_id}) へ接続テスト中...", fg=LightPalette.FG_SUB)
+        self.update_idletasks()
+
+        def worker() -> None:
+            ok, msg = GeminiVisionAnalyzer.test_connection(tmp_cfg)
+            self.after(0, lambda o=ok, m=msg: self._on_test_done(o, m))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_test_done(self, ok: bool, msg: str) -> None:
+        if not self.winfo_exists():
+            return
+        self._is_testing = False
+        self.btn_test_conn.configure(state=tk.NORMAL, text="接続テスト")
+        self.test_status_lbl.configure(text=msg, fg="#059669" if ok else "#DC2626")
+
+    def _save(self) -> None:
+        self.config_obj.api_key = self.api_key_var.get().strip()
+        self.config_obj.model_name = strip_gemini_model_prefix(self.model_var.get()) or DEFAULT_OPTIMAL_GEMINI_MODEL
+        self.config_obj.auto_use_on_load = self.auto_load_var.get()
+        self.config_obj.use_for_area_select = self.area_ai_var.get()
+        self.config_obj.replace_existing_on_ai = self.replace_var.get()
+        self.config_obj.custom_instruction = self.custom_var.get().strip()
+        self.config_obj.save_api_key = self.save_key_var.get()
+        live_only = [m for m in self.model_entries if m.get("source") == "API利用可能"]
+        if live_only:
+            self.config_obj.cached_models = live_only
+        self.config_obj.save()
+        if self.on_save_callback:
+            self.on_save_callback()
+        self.destroy()
+
 
 class WeightCalculatorDialog(tk.Toplevel):
-    """形状(板材・丸棒・丸パイプ・角パイプ・六角棒)と材質比重から単重(kg)を計算するダイアログ"""
-
     def __init__(self, parent: tk.Misc, initial_material: str, on_apply_callback: Any):
         super().__init__(parent)
-        self.title("部品重量計算ツール - PartLens_Miya-v1.0.0")
-        self.geometry("520x470")
+        self.title(f"部品重量計算ツール - {APP_NAME}")
+        self.geometry("500x450")
         self.configure(bg=LightPalette.BG_MAIN)
         self.resizable(False, False)
         self.transient(parent)
@@ -2008,135 +2868,63 @@ class WeightCalculatorDialog(tk.Toplevel):
         enforce_windows_light_mode(self)
 
         self.on_apply_callback = on_apply_callback
-        self.calculated_weight: float = 0.0
-        self.generated_spec: str = ""
-
+        self.calculated_weight = 0.0
+        self.generated_spec = ""
         self._build_ui(initial_material)
         self._recalculate()
 
     def _build_ui(self, initial_material: str) -> None:
         header = tk.Frame(self, bg=LightPalette.BG_HEADER, padx=16, pady=10)
         header.pack(fill=tk.X)
-        tk.Label(
-            header,
-            text="形状・材質からの単重(kg)自動計算機",
-            bg=LightPalette.BG_HEADER,
-            fg=LightPalette.FG_HEADER,
-            font=("Meiryo UI", 11, "bold"),
-        ).pack(anchor="w")
+        tk.Label(header, text="形状・材質からの単重(kg)自動計算機", bg=LightPalette.BG_HEADER, fg="#FFFFFF", font=("Meiryo UI", 11, "bold")).pack(anchor="w")
 
-        body = tk.Frame(self, bg=LightPalette.BG_PANEL, padx=20, pady=16)
+        body = tk.Frame(self, bg=LightPalette.BG_PANEL, padx=20, pady=14)
         body.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
 
-        # 1. 形状選択
-        tk.Label(body, text="1. 部品の形状:", bg=LightPalette.BG_PANEL, fg=LightPalette.FG_MAIN, font=("Meiryo UI", 9, "bold")).grid(
-            row=0, column=0, sticky="w", pady=6
-        )
+        tk.Label(body, text="1. 部品の形状:", bg=LightPalette.BG_PANEL, font=("Meiryo UI", 9, "bold")).grid(row=0, column=0, sticky="w", pady=5)
         self.shape_var = tk.StringVar(value="プレート / 角材 (t × W × L)")
-        shapes = [
-            "プレート / 角材 (t × W × L)",
-            "丸棒 / 円柱 (φD × L)",
-            "丸パイプ (外径φD × 肉厚t × L)",
-            "角パイプ (辺A × 辺B × 肉厚t × L)",
-            "六角棒 (対辺H × L)",
-        ]
-        self.shape_combo = ttk.Combobox(body, textvariable=self.shape_var, values=shapes, state="readonly", width=34)
-        self.shape_combo.grid(row=0, column=1, sticky="ew", pady=6, padx=6)
-        self.shape_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_shape_change())
+        shapes = ["プレート / 角材 (t × W × L)", "丸棒 / 円柱 (φD × L)", "丸パイプ (外径φD × 肉厚t × L)", "角パイプ (辺A × 辺B × 肉厚t × L)", "六角棒 (対辺H × L)"]
+        cb_s = ttk.Combobox(body, textvariable=self.shape_var, values=shapes, state="readonly", width=32)
+        cb_s.grid(row=0, column=1, sticky="ew", pady=5, padx=6)
+        cb_s.bind("<<ComboboxSelected>>", lambda _e: self._on_shape_change())
 
-        # 2. 材質選択
-        tk.Label(body, text="2. 材質 (JIS規格):", bg=LightPalette.BG_PANEL, fg=LightPalette.FG_MAIN, font=("Meiryo UI", 9, "bold")).grid(
-            row=1, column=0, sticky="w", pady=6
-        )
-        mat_default = initial_material if initial_material in MATERIAL_MASTER else "SS400"
-        self.mat_var = tk.StringVar(value=mat_default)
-        self.mat_combo = ttk.Combobox(
-            body, textvariable=self.mat_var, values=list(MATERIAL_MASTER.keys()), width=34
-        )
-        self.mat_combo.grid(row=1, column=1, sticky="ew", pady=6, padx=6)
-        self.mat_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_mat_change())
+        tk.Label(body, text="2. 材質 (JIS):", bg=LightPalette.BG_PANEL, font=("Meiryo UI", 9, "bold")).grid(row=1, column=0, sticky="w", pady=5)
+        mat_def = initial_material if initial_material in MATERIAL_MASTER else "SS400"
+        self.mat_var = tk.StringVar(value=mat_def)
+        cb_m = ttk.Combobox(body, textvariable=self.mat_var, values=list(MATERIAL_MASTER.keys()), width=32)
+        cb_m.grid(row=1, column=1, sticky="ew", pady=5, padx=6)
+        cb_m.bind("<<ComboboxSelected>>", lambda _e: self._on_mat_change())
 
-        # 3. 比重
-        tk.Label(body, text="3. 比重 (g/cm³):", bg=LightPalette.BG_PANEL, fg=LightPalette.FG_MAIN, font=("Meiryo UI", 9)).grid(
-            row=2, column=0, sticky="w", pady=6
-        )
-        init_density = MATERIAL_MASTER.get(mat_default, {}).get("density", 7.85)
-        self.density_var = tk.StringVar(value=str(init_density))
-        self.density_entry = ttk.Entry(body, textvariable=self.density_var, width=18)
-        self.density_entry.grid(row=2, column=1, sticky="w", pady=6, padx=6)
+        tk.Label(body, text="3. 比重 (g/cm³):", bg=LightPalette.BG_PANEL).grid(row=2, column=0, sticky="w", pady=5)
+        self.density_var = tk.StringVar(value=str(MATERIAL_MASTER.get(mat_def, {}).get("density", 7.85)))
         self.density_var.trace_add("write", lambda *_: self._recalculate())
+        ttk.Entry(body, textvariable=self.density_var, width=16).grid(row=2, column=1, sticky="w", pady=5, padx=6)
 
-        # 4. 寸法パラメータ入力欄 (最大4個)
         self.dim_labels: List[tk.Label] = []
         self.dim_vars: List[tk.StringVar] = []
         self.dim_entries: List[ttk.Entry] = []
-        default_vals = ["10", "100", "200", "3.2"]
-
-        for i in range(4):
-            lbl = tk.Label(body, text=f"寸法 {i + 1} (mm):", bg=LightPalette.BG_PANEL, fg=LightPalette.FG_MAIN, font=("Meiryo UI", 9))
-            lbl.grid(row=3 + i, column=0, sticky="w", pady=5)
-            v = tk.StringVar(value=default_vals[i])
+        for i, dv in enumerate(["10", "100", "200", "3.2"]):
+            lbl = tk.Label(body, text=f"寸法 {i + 1} (mm):", bg=LightPalette.BG_PANEL)
+            lbl.grid(row=3 + i, column=0, sticky="w", pady=4)
+            v = tk.StringVar(value=dv)
             v.trace_add("write", lambda *_: self._recalculate())
-            ent = ttk.Entry(body, textvariable=v, width=20)
-            ent.grid(row=3 + i, column=1, sticky="w", pady=5, padx=6)
+            ent = ttk.Entry(body, textvariable=v, width=18)
+            ent.grid(row=3 + i, column=1, sticky="w", pady=4, padx=6)
             self.dim_labels.append(lbl)
             self.dim_vars.append(v)
             self.dim_entries.append(ent)
 
-        # 計算結果表示カード
-        res_frame = tk.Frame(body, bg=LightPalette.BG_SELECTED, padx=14, pady=10, highlightthickness=1, highlightbackground=LightPalette.BORDER_FOCUS)
-        res_frame.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(14, 10))
-
-        self.result_lbl = tk.Label(
-            res_frame,
-            text="計算単重: 0.000 kg",
-            bg=LightPalette.BG_SELECTED,
-            fg=LightPalette.FG_ACCENT,
-            font=("Meiryo UI", 13, "bold"),
-        )
+        res_f = tk.Frame(body, bg=LightPalette.BG_SELECTED, padx=12, pady=8)
+        res_f.grid(row=7, column=0, columnspan=2, sticky="ew", pady=12)
+        self.result_lbl = tk.Label(res_f, text="計算単重: 0.000 kg", bg=LightPalette.BG_SELECTED, fg=LightPalette.FG_ACCENT, font=("Meiryo UI", 12, "bold"))
         self.result_lbl.pack(anchor="w")
+        self.spec_lbl = tk.Label(res_f, text="", bg=LightPalette.BG_SELECTED, fg=LightPalette.FG_SUB, font=("Meiryo UI", 9))
+        self.spec_lbl.pack(anchor="w")
 
-        self.spec_lbl = tk.Label(
-            res_frame,
-            text="寸法表記: t10x100x200",
-            bg=LightPalette.BG_SELECTED,
-            fg=LightPalette.FG_SUB,
-            font=("Meiryo UI", 9),
-        )
-        self.spec_lbl.pack(anchor="w", pady=(2, 0))
-
-        # ボタンバー
-        btn_bar = tk.Frame(body, bg=LightPalette.BG_PANEL)
-        btn_bar.grid(row=8, column=0, columnspan=2, sticky="e", pady=(8, 0))
-
-        tk.Button(
-            btn_bar,
-            text="選択中の部品行へ反映",
-            bg=LightPalette.BTN_PRIMARY_BG,
-            fg=LightPalette.BTN_PRIMARY_FG,
-            activebackground=LightPalette.BTN_PRIMARY_ACTIVE,
-            activeforeground=LightPalette.BTN_PRIMARY_FG,
-            relief=tk.FLAT,
-            padx=16,
-            pady=6,
-            font=("Meiryo UI", 9, "bold"),
-            cursor="hand2",
-            command=self._apply_and_close,
-        ).pack(side=tk.LEFT, padx=6)
-
-        tk.Button(
-            btn_bar,
-            text="閉じる",
-            bg=LightPalette.BTN_DEFAULT_BG,
-            fg=LightPalette.BTN_DEFAULT_FG,
-            relief=tk.SOLID,
-            bd=1,
-            padx=14,
-            pady=6,
-            font=("Meiryo UI", 9),
-            command=self.destroy,
-        ).pack(side=tk.LEFT)
-
+        btn_b = tk.Frame(body, bg=LightPalette.BG_PANEL)
+        btn_b.grid(row=8, column=0, columnspan=2, sticky="e")
+        tk.Button(btn_b, text="選択中の部品行へ反映", bg=LightPalette.BTN_PRIMARY_BG, fg="#FFFFFF", relief=tk.FLAT, padx=14, pady=5, font=("Meiryo UI", 9, "bold"), command=self._apply).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_b, text="閉じる", bg=LightPalette.BTN_DEFAULT_BG, relief=tk.SOLID, bd=1, padx=12, pady=5, command=self.destroy).pack(side=tk.LEFT)
         self._on_shape_change()
 
     def _on_mat_change(self) -> None:
@@ -2146,24 +2934,20 @@ class WeightCalculatorDialog(tk.Toplevel):
         self._recalculate()
 
     def _on_shape_change(self) -> None:
-        shape = self.shape_var.get()
-        if "プレート" in shape:
-            configs = [("板厚 t (mm):", True), ("幅 W (mm):", True), ("長さ L (mm):", True), ("-", False)]
-        elif "丸棒" in shape:
-            configs = [("外径 φD (mm):", True), ("長さ L (mm):", True), ("-", False), ("-", False)]
-        elif "丸パイプ" in shape:
-            configs = [("外径 φD (mm):", True), ("肉厚 t (mm):", True), ("長さ L (mm):", True), ("-", False)]
-        elif "角パイプ" in shape:
-            configs = [("辺 A (mm):", True), ("辺 B (mm):", True), ("肉厚 t (mm):", True), ("長さ L (mm):", True)]
+        s = self.shape_var.get()
+        if "プレート" in s:
+            cfgs = [("板厚 t (mm):", True), ("幅 W (mm):", True), ("長さ L (mm):", True), ("-", False)]
+        elif "丸棒" in s:
+            cfgs = [("外径 φD (mm):", True), ("長さ L (mm):", True), ("-", False), ("-", False)]
+        elif "丸パイプ" in s:
+            cfgs = [("外径 φD (mm):", True), ("肉厚 t (mm):", True), ("長さ L (mm):", True), ("-", False)]
+        elif "角パイプ" in s:
+            cfgs = [("辺 A (mm):", True), ("辺 B (mm):", True), ("肉厚 t (mm):", True), ("長さ L (mm):", True)]
         else:
-            configs = [("六角対辺 H (mm):", True), ("長さ L (mm):", True), ("-", False), ("-", False)]
-
-        for i, (label_text, active) in enumerate(configs):
-            self.dim_labels[i].configure(text=label_text)
-            if active:
-                self.dim_entries[i].configure(state="normal")
-            else:
-                self.dim_entries[i].configure(state="disabled")
+            cfgs = [("六角対辺 H (mm):", True), ("長さ L (mm):", True), ("-", False), ("-", False)]
+        for i, (lt, act) in enumerate(cfgs):
+            self.dim_labels[i].configure(text=lt)
+            self.dim_entries[i].configure(state="normal" if act else "disabled")
         self._recalculate()
 
     def _recalculate(self) -> None:
@@ -2172,138 +2956,67 @@ class WeightCalculatorDialog(tk.Toplevel):
             vals = [float(v.get() or 0.0) for v in self.dim_vars]
         except ValueError:
             return
-
-        shape = self.shape_var.get()
-        vol_mm3 = 0.0
-        spec_str = ""
-
-        if "プレート" in shape:
-            t, w, length = vals[0], vals[1], vals[2]
-            vol_mm3 = t * w * length
-            spec_str = f"t{t:g}x{w:g}x{length:g}"
-        elif "丸棒" in shape:
-            d, length = vals[0], vals[1]
-            r = d * 0.5
-            vol_mm3 = math.pi * (r * r) * length
-            spec_str = f"φ{d:g}x{length:g}"
-        elif "丸パイプ" in shape:
-            d, t, length = vals[0], vals[1], vals[2]
-            r_out = d * 0.5
-            r_in = max(r_out - t, 0.0)
-            vol_mm3 = math.pi * (r_out * r_out - r_in * r_in) * length
-            spec_str = f"φ{d:g}xt{t:g}x{length:g}"
-        elif "角パイプ" in shape:
-            a, b, t, length = vals[0], vals[1], vals[2], vals[3]
-            inner_a = max(a - 2.0 * t, 0.0)
-            inner_b = max(b - 2.0 * t, 0.0)
-            vol_mm3 = (a * b - inner_a * inner_b) * length
-            spec_str = f"{a:g}x{b:g}xt{t:g}x{length:g}"
+        s = self.shape_var.get()
+        if "プレート" in s:
+            vol, spec = vals[0] * vals[1] * vals[2], f"t{vals[0]:g}x{vals[1]:g}x{vals[2]:g}"
+        elif "丸棒" in s:
+            r = vals[0] * 0.5
+            vol, spec = math.pi * (r * r) * vals[1], f"φ{vals[0]:g}x{vals[1]:g}"
+        elif "丸パイプ" in s:
+            ro, ri = vals[0] * 0.5, max(vals[0] * 0.5 - vals[1], 0.0)
+            vol, spec = math.pi * (ro * ro - ri * ri) * vals[2], f"φ{vals[0]:g}xt{vals[1]:g}x{vals[2]:g}"
+        elif "角パイプ" in s:
+            ia, ib = max(vals[0] - 2.0 * vals[2], 0.0), max(vals[1] - 2.0 * vals[2], 0.0)
+            vol, spec = (vals[0] * vals[1] - ia * ib) * vals[3], f"{vals[0]:g}x{vals[1]:g}xt{vals[2]:g}x{vals[3]:g}"
         else:
-            h, length = vals[0], vals[1]
-            # 正六角形面積 = (sqrt(3)/2) * H^2
-            vol_mm3 = (math.sqrt(3.0) * 0.5) * (h * h) * length
-            spec_str = f"HEX{h:g}x{length:g}"
-
-        self.calculated_weight = round(max(vol_mm3, 0.0) * density / 1_000_000.0, 3)
-        self.generated_spec = spec_str
+            vol, spec = (math.sqrt(3.0) * 0.5) * (vals[0] * vals[0]) * vals[1], f"HEX{vals[0]:g}x{vals[1]:g}"
+        self.calculated_weight = round(max(vol, 0.0) * density / 1_000_000.0, 3)
+        self.generated_spec = spec
         self.result_lbl.configure(text=f"計算単重: {self.calculated_weight:.3f} kg")
-        self.spec_lbl.configure(text=f"寸法表記: {spec_str}  (材質: {self.mat_var.get()})")
+        self.spec_lbl.configure(text=f"寸法表記: {spec} (材質: {self.mat_var.get()})")
 
-    def _apply_and_close(self) -> None:
+    def _apply(self) -> None:
         if self.on_apply_callback:
             self.on_apply_callback(self.calculated_weight, self.generated_spec, self.mat_var.get())
         self.destroy()
 
 
 class ExcelSettingsDialog(tk.Toplevel):
-    """Excel出力フォーマットやシート構成を設定するダイアログ"""
-
     def __init__(self, parent: tk.Misc, config: ExcelExportConfig, on_save_callback: Any):
         super().__init__(parent)
-        self.title("Excel出力設定 - PartLens_Miya-v1.0.0")
-        self.geometry("480x360")
+        self.title(f"Excel出力設定 - {APP_NAME}")
+        self.geometry("460x340")
         self.configure(bg=LightPalette.BG_MAIN)
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
         enforce_windows_light_mode(self)
-
         self.config_obj = config
         self.on_save_callback = on_save_callback
-        self._build_ui()
 
-    def _build_ui(self) -> None:
         header = tk.Frame(self, bg=LightPalette.BG_HEADER, padx=16, pady=10)
         header.pack(fill=tk.X)
-        tk.Label(
-            header,
-            text="Excel部品表 (.xlsx) 出力オプション設定",
-            bg=LightPalette.BG_HEADER,
-            fg=LightPalette.FG_HEADER,
-            font=("Meiryo UI", 11, "bold"),
-        ).pack(anchor="w")
+        tk.Label(header, text="Excel部品表 (.xlsx) 出力設定", bg=LightPalette.BG_HEADER, fg="#FFFFFF", font=("Meiryo UI", 11, "bold")).pack(anchor="w")
 
-        body = tk.Frame(self, bg=LightPalette.BG_PANEL, padx=20, pady=16)
+        body = tk.Frame(self, bg=LightPalette.BG_PANEL, padx=20, pady=14)
         body.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
 
-        tk.Label(
-            body, text="出力テンプレート形式:", bg=LightPalette.BG_PANEL, fg=LightPalette.FG_MAIN, font=("Meiryo UI", 9, "bold")
-        ).pack(anchor="w", pady=(0, 6))
+        self.tpl_var = tk.StringVar(value=config.template_type)
+        for lt, vt in [("標準部品表フォーマット（全項目・推奨）", "standard"), ("購買・見積手配用フォーマット", "purchasing"), ("製造・加工手配用フォーマット", "manufacturing")]:
+            ttk.Radiobutton(body, text=lt, variable=self.tpl_var, value=vt).pack(anchor="w", pady=2)
 
-        self.tpl_var = tk.StringVar(value=self.config_obj.template_type)
-        tpl_options = [
-            ("標準部品表フォーマット（全項目・推奨）", "standard"),
-            ("購買・見積手配用フォーマット（メーカー・金額重視）", "purchasing"),
-            ("製造・加工手配用フォーマット（材質・寸法・重量重視）", "manufacturing"),
-        ]
-        for label_t, val_t in tpl_options:
-            ttk.Radiobutton(body, text=label_t, variable=self.tpl_var, value=val_t).pack(anchor="w", padx=12, pady=2)
+        ttk.Separator(body, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+        self.split_var = tk.BooleanVar(value=config.split_by_drawing)
+        ttk.Checkbutton(body, text="複数図面がある場合に「図面別シート」も同時作成する", variable=self.split_var).pack(anchor="w", pady=2)
+        self.merge_var = tk.BooleanVar(value=config.merge_duplicates)
+        ttk.Checkbutton(body, text="出力時に同一品番・品名を名寄せ（数量合算）して集計する", variable=self.merge_var).pack(anchor="w", pady=2)
+        self.prev_var = tk.BooleanVar(value=config.include_preview_sheet)
+        ttk.Checkbutton(body, text="別シートに「2D図面プレビュー画像」を添付する", variable=self.prev_var).pack(anchor="w", pady=2)
 
-        ttk.Separator(body, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=12)
-
-        self.split_var = tk.BooleanVar(value=self.config_obj.split_by_drawing)
-        ttk.Checkbutton(
-            body, text="複数図面がある場合に「図面別シート」も同時作成する", variable=self.split_var
-        ).pack(anchor="w", pady=3)
-
-        self.merge_var = tk.BooleanVar(value=self.config_obj.merge_duplicates)
-        ttk.Checkbutton(
-            body, text="出力時に同一品番・品名を名寄せ（数量合算）して集計する", variable=self.merge_var
-        ).pack(anchor="w", pady=3)
-
-        self.prev_var = tk.BooleanVar(value=self.config_obj.include_preview_sheet)
-        ttk.Checkbutton(
-            body, text="別シートに「2D図面プレビュー画像」を添付する", variable=self.prev_var
-        ).pack(anchor="w", pady=3)
-
-        btn_bar = tk.Frame(body, bg=LightPalette.BG_PANEL)
-        btn_bar.pack(fill=tk.X, pady=(18, 0))
-
-        tk.Button(
-            btn_bar,
-            text="設定を保存",
-            bg=LightPalette.BTN_PRIMARY_BG,
-            fg=LightPalette.BTN_PRIMARY_FG,
-            relief=tk.FLAT,
-            padx=18,
-            pady=6,
-            font=("Meiryo UI", 9, "bold"),
-            cursor="hand2",
-            command=self._save,
-        ).pack(side=tk.RIGHT, padx=(6, 0))
-
-        tk.Button(
-            btn_bar,
-            text="キャンセル",
-            bg=LightPalette.BTN_DEFAULT_BG,
-            fg=LightPalette.BTN_DEFAULT_FG,
-            relief=tk.SOLID,
-            bd=1,
-            padx=14,
-            pady=6,
-            font=("Meiryo UI", 9),
-            command=self.destroy,
-        ).pack(side=tk.RIGHT)
+        btn_b = tk.Frame(body, bg=LightPalette.BG_PANEL)
+        btn_b.pack(fill=tk.X, pady=(14, 0))
+        tk.Button(btn_b, text="設定を保存", bg=LightPalette.BTN_PRIMARY_BG, fg="#FFFFFF", relief=tk.FLAT, padx=16, pady=5, font=("Meiryo UI", 9, "bold"), command=self._save).pack(side=tk.RIGHT, padx=4)
+        tk.Button(btn_b, text="キャンセル", bg=LightPalette.BTN_DEFAULT_BG, relief=tk.SOLID, bd=1, padx=12, pady=5, command=self.destroy).pack(side=tk.RIGHT)
 
     def _save(self) -> None:
         self.config_obj.template_type = self.tpl_var.get()
@@ -2316,56 +3029,175 @@ class ExcelSettingsDialog(tk.Toplevel):
 
 
 class ReadmeViewerDialog(tk.Toplevel):
-    """同梱のREADME.md（取扱説明書）をアプリ内でわかりやすく表示するダイアログ"""
+    """目次ジャンプ・キーワード検索・リッチテキスト整形付きの取扱説明書ビューア"""
 
     def __init__(self, parent: tk.Misc):
         super().__init__(parent)
         self.title(f"使い方ガイド (取扱説明書) - {APP_NAME}")
-        self.geometry("760x620")
+        self.geometry("880x680")
+        self.minsize(720, 520)
         self.configure(bg=LightPalette.BG_MAIN)
         self.transient(parent)
         enforce_windows_light_mode(self)
+
+        self.section_marks: List[Tuple[str, str]] = []
+        self._search_pos = "1.0"
 
         header = tk.Frame(self, bg=LightPalette.BG_HEADER, padx=16, pady=10)
         header.pack(fill=tk.X)
         tk.Label(
             header,
-            text=f"{APP_NAME} 取扱説明書・操作ガイド",
+            text=f"{APP_NAME} 使い方ガイド（取扱説明書）",
             bg=LightPalette.BG_HEADER,
-            fg=LightPalette.FG_HEADER,
-            font=("Meiryo UI", 11, "bold"),
+            fg="#FFFFFF",
+            font=("Meiryo UI", 12, "bold"),
         ).pack(side=tk.LEFT)
 
-        text_frame = tk.Frame(self, bg=LightPalette.BG_PANEL, padx=12, pady=12)
-        text_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+        search_box = tk.Frame(header, bg=LightPalette.BG_HEADER)
+        search_box.pack(side=tk.RIGHT)
+        tk.Label(search_box, text="ガイド内検索:", bg=LightPalette.BG_HEADER, fg="#E2E8F0", font=("Meiryo UI", 8, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+        self.search_var = tk.StringVar(value="")
+        s_ent = ttk.Entry(search_box, textvariable=self.search_var, width=20)
+        s_ent.pack(side=tk.LEFT, padx=2)
+        s_ent.bind("<Return>", lambda _e: self._search_next())
+        tk.Button(
+            search_box, text="次を検索", command=self._search_next,
+            bg="#2563EB", fg="#FFFFFF", relief=tk.FLAT, padx=8, pady=2, font=("Meiryo UI", 8, "bold"), cursor="hand2"
+        ).pack(side=tk.LEFT, padx=2)
+        tk.Button(
+            search_box, text="クリア", command=self._clear_search,
+            bg="#FFFFFF", fg="#1E293B", relief=tk.FLAT, padx=6, pady=2, font=("Meiryo UI", 8), cursor="hand2"
+        ).pack(side=tk.LEFT, padx=2)
 
-        scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL)
-        txt_widget = tk.Text(
-            text_frame,
+        # 目次ジャンプバー
+        self.nav_bar = tk.Frame(self, bg="#E2E8F0", padx=12, pady=6)
+        self.nav_bar.pack(fill=tk.X)
+        tk.Label(self.nav_bar, text="目次ジャンプ:", bg="#E2E8F0", fg=LightPalette.FG_ACCENT, font=("Meiryo UI", 8, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+
+        tf = tk.Frame(self, bg=LightPalette.BG_PANEL, padx=10, pady=10, bd=1, relief=tk.SOLID)
+        tf.pack(fill=tk.BOTH, expand=True, padx=12, pady=(8, 10))
+        sb = ttk.Scrollbar(tf, orient=tk.VERTICAL)
+        self.txt = tk.Text(
+            tf,
             bg=LightPalette.BG_PANEL,
             fg=LightPalette.FG_MAIN,
             font=("Meiryo UI", 10),
             wrap=tk.WORD,
-            yscrollcommand=scrollbar.set,
+            yscrollcommand=sb.set,
             relief=tk.FLAT,
-            padx=10,
-            pady=8,
+            padx=14,
+            pady=10,
+            spacing1=2,
+            spacing2=2,
+            spacing3=4,
         )
-        scrollbar.configure(command=txt_widget.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        txt_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.configure(command=self.txt.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        readme_path = get_resource_path("README.md")
-        content = "取扱説明書ファイル (README.md) が見つかりませんでした。"
-        if os.path.exists(readme_path):
+        self._configure_text_tags()
+
+        rp = get_resource_path("README.md")
+        content = "README.md が見つかりませんでした。"
+        if os.path.exists(rp):
             try:
-                with open(readme_path, "r", encoding="utf-8") as f:
+                with open(rp, "r", encoding="utf-8") as f:
                     content = f.read()
             except Exception as e:
-                content = f"読み込みエラー: {e}"
+                content = str(e)
 
-        txt_widget.insert("1.0", content)
-        txt_widget.configure(state=tk.DISABLED)
+        self._render_formatted_markdown(content)
+        self._build_nav_buttons()
+        self.txt.configure(state=tk.DISABLED)
+
+    def _configure_text_tags(self) -> None:
+        self.txt.tag_configure("h1", font=("Meiryo UI", 14, "bold"), foreground="#1E3A8A", background="#EFF6FF", spacing1=8, spacing3=8, lmargin1=6, lmargin2=6)
+        self.txt.tag_configure("h2", font=("Meiryo UI", 11, "bold"), foreground="#1D4ED8", background="#F8FAFC", spacing1=12, spacing3=6, lmargin1=4, lmargin2=4)
+        self.txt.tag_configure("h3", font=("Meiryo UI", 10, "bold"), foreground="#5B21B6", spacing1=8, spacing3=4, lmargin1=8, lmargin2=8)
+        self.txt.tag_configure("bullet", font=("Meiryo UI", 10), foreground="#0F172A", lmargin1=18, lmargin2=32, spacing1=2, spacing3=2)
+        self.txt.tag_configure("sub_bullet", font=("Meiryo UI", 9), foreground="#334155", lmargin1=36, lmargin2=50, spacing1=1, spacing3=2)
+        self.txt.tag_configure("step", font=("Meiryo UI", 10), foreground="#0F172A", lmargin1=14, lmargin2=28, spacing1=3, spacing3=3)
+        self.txt.tag_configure("code", font=("Consolas", 10, "bold"), foreground="#1E40AF", background="#DBEAFE")
+        self.txt.tag_configure("hr", font=("Meiryo UI", 6), foreground="#CBD5E1", spacing1=4, spacing3=4)
+        self.txt.tag_configure("search_hit", background="#FEF08A", foreground="#0F172A")
+
+    def _insert_line_with_inline_code(self, line_text: str, base_tag: str = "") -> None:
+        parts = re.split(r"(`[^`]+`)", line_text)
+        for part in parts:
+            if not part:
+                continue
+            if part.startswith("`") and part.endswith("`") and len(part) >= 2:
+                code_str = f" {part[1:-1]} "
+                tags = (base_tag, "code") if base_tag else ("code",)
+                self.txt.insert(tk.END, code_str, tags)
+            else:
+                tags = (base_tag,) if base_tag else ()
+                self.txt.insert(tk.END, part, tags)
+        self.txt.insert(tk.END, "\n", (base_tag,) if base_tag else ())
+
+    def _render_formatted_markdown(self, raw_md: str) -> None:
+        for line in raw_md.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("# "):
+                title_t = stripped[2:].strip()
+                self.txt.insert(tk.END, f"  {title_t}\n", ("h1",))
+            elif stripped.startswith("## "):
+                sec_t = stripped[3:].strip()
+                mark_name = f"sec_{len(self.section_marks)}"
+                idx_pos = self.txt.index(tk.END)
+                self.txt.mark_set(mark_name, idx_pos)
+                self.txt.mark_gravity(mark_name, tk.LEFT)
+                short_lbl = re.sub(r"^\d+\.\s*", "", sec_t)[:14]
+                self.section_marks.append((short_lbl, mark_name))
+                self.txt.insert(tk.END, f"■ {sec_t}\n", ("h2",))
+            elif stripped.startswith("### "):
+                sub_t = stripped[4:].strip()
+                self.txt.insert(tk.END, f"◆ {sub_t}\n", ("h3",))
+            elif stripped == "---":
+                self.txt.insert(tk.END, "─" * 76 + "\n", ("hr",))
+            elif line.startswith("   - ") or line.startswith("     - ") or line.startswith("  - "):
+                self._insert_line_with_inline_code("・ " + stripped[2:].strip(), "sub_bullet")
+            elif stripped.startswith("- "):
+                self._insert_line_with_inline_code("● " + stripped[2:].strip(), "bullet")
+            elif re.match(r"^\d+\.\s+", stripped):
+                self._insert_line_with_inline_code(stripped, "step")
+            else:
+                self._insert_line_with_inline_code(line, "")
+
+    def _build_nav_buttons(self) -> None:
+        for lbl, mark in self.section_marks:
+            tk.Button(
+                self.nav_bar,
+                text=lbl,
+                command=lambda m=mark: self.txt.see(m),
+                bg="#FFFFFF",
+                fg="#1E3A8A",
+                relief=tk.SOLID,
+                bd=1,
+                padx=7,
+                pady=2,
+                font=("Meiryo UI", 8, "bold"),
+                cursor="hand2",
+            ).pack(side=tk.LEFT, padx=2)
+
+    def _search_next(self) -> None:
+        kw = self.search_var.get().strip()
+        self.txt.tag_remove("search_hit", "1.0", tk.END)
+        if not kw:
+            return
+        pos = self.txt.search(kw, self._search_pos, stopindex=tk.END, nocase=True)
+        if not pos:
+            pos = self.txt.search(kw, "1.0", stopindex=tk.END, nocase=True)
+        if pos:
+            end_pos = f"{pos}+{len(kw)}c"
+            self.txt.tag_add("search_hit", pos, end_pos)
+            self.txt.see(pos)
+            self._search_pos = end_pos
+
+    def _clear_search(self) -> None:
+        self.search_var.set("")
+        self._search_pos = "1.0"
+        self.txt.tag_remove("search_hit", "1.0", tk.END)
 
 
 # ==============================================================================
@@ -2373,35 +3205,19 @@ class ReadmeViewerDialog(tk.Toplevel):
 # ==============================================================================
 
 class PartLensApp:
-    """PartLens_Miya-v1.0.0 メインデスクトップアプリケーションクラス"""
-
     TREE_COLUMNS = (
-        "item_no",
-        "part_number",
-        "part_name",
-        "specification",
-        "material",
-        "treatment",
-        "quantity",
-        "unit",
-        "unit_weight",
-        "total_weight",
-        "category",
-        "manufacturer",
-        "unit_price",
-        "amount",
-        "source_file",
-        "remarks",
+        "item_no", "part_number", "part_name", "specification", "material", "treatment",
+        "quantity", "unit", "unit_weight", "total_weight", "category", "manufacturer",
+        "unit_price", "amount", "source_file", "remarks",
     )
 
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("1480x900")
-        self.root.minsize(1180, 720)
+        self.root.geometry("1500x900")
+        self.root.minsize(1200, 720)
         self.root.configure(bg=LightPalette.BG_MAIN)
 
-        # アイコン設定
         icon_path = get_resource_path("icon.ico")
         if os.path.exists(icon_path):
             try:
@@ -2409,635 +3225,430 @@ class PartLensApp:
             except Exception:
                 pass
 
-        # ライトモード完全固定スタイルの適用
         self._setup_light_mode_styles()
         enforce_windows_light_mode(self.root)
 
-        # アプリ状態データ
+        self.gemini_config = GeminiConfig()
+        self.gemini_config.load()
+        self.is_ai_busy = False
+
         self.documents: List[DrawingDocument] = []
-        self.current_doc_idx: int = -1
-        self.current_page_idx: int = 0
+        self.current_doc_idx = -1
+        self.current_page_idx = 0
         self.parts: List[PartItem] = []
         self.selected_part_uid: Optional[str] = None
 
-        # Undo / Redo 履歴スタック
         self.undo_stack: List[List[PartItem]] = []
         self.redo_stack: List[List[PartItem]] = []
 
-        # プレビューキャンバス状態
-        self.zoom_scale: float = 1.0
-        self.canvas_offset_x: float = 0.0
-        self.canvas_offset_y: float = 0.0
-        self.interaction_mode: str = "pan"  # "pan" or "select_area"
-        self.drag_start_x: int = 0
-        self.drag_start_y: int = 0
+        self.zoom_scale = 1.0
+        self.canvas_offset_x = 0.0
+        self.canvas_offset_y = 0.0
+        self.interaction_mode = "pan"
+        self.drag_start_x = 0
+        self.drag_start_y = 0
         self.selection_rect_id: Optional[int] = None
         self.highlight_bbox: Optional[Tuple[float, float, float, float]] = None
         self._tk_preview_img: Optional[ImageTk.PhotoImage] = None
         self._inline_editor: Optional[tk.Widget] = None
+        self._sort_col_desc: Dict[str, bool] = {}
 
-        # Excel出力設定
-        self.excel_config = ExcelExportConfig(
-            project_name="新規機械設計プロジェクト",
-            drawing_no="ASM-0001",
-            author_name="",
-        )
+        self.excel_config = ExcelExportConfig(project_name="新規機械設計プロジェクト", drawing_no="ASM-0001")
 
-        # UI構築
         self._build_header()
         self._build_main_workspace()
         self._build_statusbar()
         self._bind_shortcuts()
+        self._refresh_quick_model_combo()
+        self._update_ai_badge()
 
-    # --------------------------------------------------------------------------
-    # ライトモード固定テーマ設定
-    # --------------------------------------------------------------------------
     def _setup_light_mode_styles(self) -> None:
-        """システムがダークモードでもアプリ内の全ウィジェットをライトモードに固定する"""
         self.root.option_add("*Background", LightPalette.BG_PANEL)
         self.root.option_add("*Foreground", LightPalette.FG_MAIN)
         self.root.option_add("*Entry.Background", "#FFFFFF")
         self.root.option_add("*Entry.Foreground", LightPalette.FG_MAIN)
         self.root.option_add("*Listbox.Background", "#FFFFFF")
         self.root.option_add("*Listbox.Foreground", LightPalette.FG_MAIN)
-        self.root.option_add("*Listbox.selectBackground", LightPalette.BG_SELECTED)
-        self.root.option_add("*Listbox.selectForeground", LightPalette.FG_ACCENT)
         self.root.option_add("*TCombobox*Listbox.background", "#FFFFFF")
         self.root.option_add("*TCombobox*Listbox.foreground", LightPalette.FG_MAIN)
-        self.root.option_add("*TCombobox*Listbox.selectBackground", LightPalette.BG_SELECTED)
-        self.root.option_add("*TCombobox*Listbox.selectForeground", LightPalette.FG_ACCENT)
 
         style = ttk.Style(self.root)
         style.theme_use("clam")
-
         style.configure(".", background=LightPalette.BG_PANEL, foreground=LightPalette.FG_MAIN, font=("Meiryo UI", 9))
         style.configure("TFrame", background=LightPalette.BG_PANEL)
-        style.configure("Main.TFrame", background=LightPalette.BG_MAIN)
-        style.configure("Sub.TFrame", background=LightPalette.BG_SUB)
         style.configure("TLabel", background=LightPalette.BG_PANEL, foreground=LightPalette.FG_MAIN, font=("Meiryo UI", 9))
-        style.configure("Sub.TLabel", background=LightPalette.BG_SUB, foreground=LightPalette.FG_SUB, font=("Meiryo UI", 9))
         style.configure("TLabelframe", background=LightPalette.BG_PANEL, bordercolor=LightPalette.BORDER)
         style.configure("TLabelframe.Label", background=LightPalette.BG_PANEL, foreground=LightPalette.FG_ACCENT, font=("Meiryo UI", 9, "bold"))
+        style.configure("TEntry", fieldbackground="#FFFFFF", foreground=LightPalette.FG_MAIN, bordercolor=LightPalette.BORDER, padding=4)
+        style.configure("TCombobox", fieldbackground="#FFFFFF", background=LightPalette.BG_SUB, foreground=LightPalette.FG_MAIN, padding=4)
+        style.map("TCombobox", fieldbackground=[("readonly", "#FFFFFF")], foreground=[("readonly", LightPalette.FG_MAIN)])
+        style.configure("TCheckbutton", background=LightPalette.BG_PANEL, foreground=LightPalette.FG_MAIN, indicatorbackground="#FFFFFF")
+        style.configure("TRadiobutton", background=LightPalette.BG_PANEL, foreground=LightPalette.FG_MAIN, indicatorbackground="#FFFFFF")
+        style.configure("Treeview", background="#FFFFFF", fieldbackground="#FFFFFF", foreground=LightPalette.FG_MAIN, rowheight=26, font=("Meiryo UI", 9))
+        style.configure("Treeview.Heading", background="#E2E8F0", foreground="#0F172A", font=("Meiryo UI", 9, "bold"), padding=(4, 5))
+        style.map("Treeview", background=[("selected", LightPalette.BG_SELECTED)], foreground=[("selected", LightPalette.FG_ACCENT)])
 
-        style.configure(
-            "TEntry",
-            fieldbackground="#FFFFFF",
-            foreground=LightPalette.FG_MAIN,
-            bordercolor=LightPalette.BORDER,
-            insertcolor=LightPalette.FG_MAIN,
-            padding=4,
-        )
-        style.configure(
-            "TCombobox",
-            fieldbackground="#FFFFFF",
-            background=LightPalette.BG_SUB,
-            foreground=LightPalette.FG_MAIN,
-            arrowcolor=LightPalette.FG_MAIN,
-            bordercolor=LightPalette.BORDER,
-            padding=4,
-        )
-        style.map(
-            "TCombobox",
-            fieldbackground=[("readonly", "#FFFFFF"), ("disabled", LightPalette.BG_SUB)],
-            foreground=[("readonly", LightPalette.FG_MAIN), ("disabled", LightPalette.FG_MUTED)],
-            selectbackground=[("readonly", "#FFFFFF")],
-            selectforeground=[("readonly", LightPalette.FG_MAIN)],
-        )
-
-        style.configure(
-            "TCheckbutton",
-            background=LightPalette.BG_PANEL,
-            foreground=LightPalette.FG_MAIN,
-            indicatorbackground="#FFFFFF",
-            indicatorforeground=LightPalette.BTN_PRIMARY_BG,
-        )
-        style.map("TCheckbutton", background=[("active", LightPalette.BG_PANEL)])
-
-        style.configure(
-            "TRadiobutton",
-            background=LightPalette.BG_PANEL,
-            foreground=LightPalette.FG_MAIN,
-            indicatorbackground="#FFFFFF",
-            indicatorforeground=LightPalette.BTN_PRIMARY_BG,
-        )
-        style.map("TRadiobutton", background=[("active", LightPalette.BG_PANEL)])
-
-        style.configure(
-            "Treeview",
-            background="#FFFFFF",
-            fieldbackground="#FFFFFF",
-            foreground=LightPalette.FG_MAIN,
-            rowheight=26,
-            bordercolor=LightPalette.BORDER,
-            font=("Meiryo UI", 9),
-        )
-        style.configure(
-            "Treeview.Heading",
-            background="#E2E8F0",
-            foreground="#0F172A",
-            relief="flat",
-            font=("Meiryo UI", 9, "bold"),
-            padding=(4, 5),
-        )
-        style.map(
-            "Treeview.Heading",
-            background=[("active", "#CBD5E1")],
-        )
-        style.map(
-            "Treeview",
-            background=[("selected", LightPalette.BG_SELECTED)],
-            foreground=[("selected", LightPalette.FG_ACCENT)],
-        )
-
-        style.configure("TPanedwindow", background=LightPalette.BG_MAIN)
-        style.configure("TScrollbar", background=LightPalette.BG_SUB, troughcolor=LightPalette.BG_MAIN, arrowcolor=LightPalette.FG_SUB)
-
-    # --------------------------------------------------------------------------
-    # UI構築: 上部ヘッダー
-    # --------------------------------------------------------------------------
     def _build_header(self) -> None:
-        header = tk.Frame(self.root, bg=LightPalette.BG_HEADER, padx=16, pady=10)
+        header = tk.Frame(self.root, bg=LightPalette.BG_HEADER, padx=14, pady=9)
         header.pack(fill=tk.X)
 
-        # 左側タイトル
         title_box = tk.Frame(header, bg=LightPalette.BG_HEADER)
         title_box.pack(side=tk.LEFT)
+        tk.Label(title_box, text="PartLens Miya", bg=LightPalette.BG_HEADER, fg="#FFFFFF", font=("Meiryo UI", 14, "bold")).pack(side=tk.LEFT)
+        self.ai_badge_lbl = tk.Label(title_box, text="Gemini AI: 未設定", bg="#312E81", fg="#E0E7FF", font=("Meiryo UI", 8, "bold"), padx=8, pady=2)
+        self.ai_badge_lbl.pack(side=tk.LEFT, padx=10)
 
-        tk.Label(
-            title_box,
-            text="PartLens Miya",
-            bg=LightPalette.BG_HEADER,
-            fg="#FFFFFF",
-            font=("Meiryo UI", 15, "bold"),
-        ).pack(side=tk.LEFT)
-
-        tk.Label(
-            title_box,
-            text="v1.0.0   |   2D図面 (PDF / CAD DXF) 部品表(BOM) 自動抽出・Excel作成システム",
-            bg=LightPalette.BG_HEADER,
-            fg="#BFDBFE",
-            font=("Meiryo UI", 9),
-            padx=10,
-        ).pack(side=tk.LEFT, pady=(4, 0))
-
-        # 右側アクションボタン群
         btn_box = tk.Frame(header, bg=LightPalette.BG_HEADER)
         btn_box.pack(side=tk.RIGHT)
+        self._hdr_btn(btn_box, "図面ファイルを開く (PDF/DXF)", self.action_open_files, "#2563EB", "#FFFFFF")
+        self._hdr_btn(btn_box, "フォルダ一括読込", self.action_open_folder, "#3B82F6", "#FFFFFF")
+        self._hdr_btn(btn_box, "サンプル図面で試す", self.action_load_sample_drawings, "#059669", "#FFFFFF")
+        self._hdr_btn(btn_box, "Gemini AI設定", self.action_open_gemini_settings, "#7C3AED", "#FFFFFF")
+        self._hdr_btn(btn_box, "プロジェクト保存", self.action_save_project, "#FFFFFF", "#1E293B")
+        self._hdr_btn(btn_box, "プロジェクト読込", self.action_load_project, "#FFFFFF", "#1E293B")
+        self._hdr_btn(btn_box, "使い方ガイド", self.action_show_readme, "#FEF3C7", "#92400E")
 
-        self._create_header_btn(btn_box, "図面ファイルを開く (PDF/DXF)", self.action_open_files, bg="#2563EB", fg="#FFFFFF")
-        self._create_header_btn(btn_box, "フォルダ一括読込", self.action_open_folder, bg="#3B82F6", fg="#FFFFFF")
-        self._create_header_btn(btn_box, "サンプル図面で試す", self.action_load_sample_drawings, bg="#059669", fg="#FFFFFF")
-        self._create_header_btn(btn_box, "プロジェクト保存", self.action_save_project, bg="#FFFFFF", fg="#1E293B")
-        self._create_header_btn(btn_box, "プロジェクト読込", self.action_load_project, bg="#FFFFFF", fg="#1E293B")
-        self._create_header_btn(btn_box, "使い方ガイド", self.action_show_readme, bg="#FEF3C7", fg="#92400E")
+    def _hdr_btn(self, parent: tk.Misc, text: str, cmd: Any, bg: str, fg: str) -> tk.Button:
+        b = tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg, activebackground=bg, activeforeground=fg, relief=tk.FLAT, padx=10, pady=4, font=("Meiryo UI", 9, "bold"), cursor="hand2")
+        b.pack(side=tk.LEFT, padx=3)
+        return b
 
-    def _create_header_btn(self, parent: tk.Misc, text: str, command: Any, bg: str, fg: str) -> tk.Button:
-        btn = tk.Button(
-            parent,
-            text=text,
-            command=command,
-            bg=bg,
-            fg=fg,
-            activebackground=bg,
-            activeforeground=fg,
-            relief=tk.FLAT,
-            padx=12,
-            pady=5,
-            font=("Meiryo UI", 9, "bold"),
-            cursor="hand2",
-        )
-        btn.pack(side=tk.LEFT, padx=4)
-        return btn
+    def _update_ai_badge(self) -> None:
+        cur_model = strip_gemini_model_prefix(self.gemini_config.model_name) or DEFAULT_OPTIMAL_GEMINI_MODEL
+        if self.gemini_config.api_key.strip():
+            self.ai_badge_lbl.configure(text=f"Gemini AI: 有効 ({cur_model})", bg="#5B21B6", fg="#FFFFFF")
+        else:
+            self.ai_badge_lbl.configure(text=f"Gemini AI: APIキー未設定 (選択モデル: {cur_model})", bg="#334155", fg="#E2E8F0")
 
-    # --------------------------------------------------------------------------
-    # UI構築: 左右分割メインワークスペース
-    # --------------------------------------------------------------------------
+    def _get_current_model_entries(self) -> List[Dict[str, Any]]:
+        if self.gemini_config.cached_models:
+            return GeminiVisionAnalyzer.merge_catalog_with_api_models(self.gemini_config.cached_models)
+        return copy.deepcopy(GEMINI_MODEL_CATALOG)
+
+    def _refresh_quick_model_combo(self) -> None:
+        if not hasattr(self, "quick_model_combo"):
+            return
+        entries = self._get_current_model_entries()
+        cur_id = strip_gemini_model_prefix(self.gemini_config.model_name) or DEFAULT_OPTIMAL_GEMINI_MODEL
+        choices: List[str] = []
+        selected_label = ""
+        for e in entries:
+            lbl = format_model_choice_label(e)
+            choices.append(lbl)
+            if e.get("id") == cur_id:
+                selected_label = lbl
+        if not selected_label:
+            custom_entry = get_gemini_model_entry(cur_id, entries)
+            selected_label = format_model_choice_label(custom_entry)
+            choices.insert(0, selected_label)
+        self.quick_model_combo.configure(values=choices)
+        self.quick_model_var.set(selected_label)
+
+    def _on_quick_model_selected(self, _event: Any = None) -> None:
+        chosen_id = extract_model_id_from_choice(self.quick_model_var.get())
+        if not chosen_id:
+            return
+        self.gemini_config.model_name = chosen_id
+        self.gemini_config.save()
+        self._update_ai_badge()
+        entry = get_gemini_model_entry(chosen_id, self._get_current_model_entries())
+        self.set_status(f"使用Geminiモデルを「{chosen_id} ({entry.get('tier_badge', '')})」に切り替えました。")
+
+    def action_select_optimal_model(self) -> None:
+        entries = self._get_current_model_entries()
+        best_id = select_optimal_gemini_model(entries, priority="balanced")
+        self.gemini_config.model_name = best_id
+        self.gemini_config.save()
+        self._refresh_quick_model_combo()
+        self._update_ai_badge()
+        self.set_status(f"2D図面解析の推奨最適モデル「{best_id}」を設定しました。")
+
+    def _on_gemini_settings_saved(self) -> None:
+        self._refresh_quick_model_combo()
+        self._update_ai_badge()
+        self.set_status(f"Gemini AI設定を更新しました（使用モデル: {self.gemini_config.model_name}）。")
+
     def _build_main_workspace(self) -> None:
         self.paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         self.paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
-        # 左ペイン: 2D図面リスト＆プレビューキャンバス
         left_pane = tk.Frame(self.paned, bg=LightPalette.BG_PANEL, bd=1, relief=tk.SOLID)
         self.paned.add(left_pane, weight=4)
         self._build_left_preview_pane(left_pane)
 
-        # 右ペイン: 部品表エディタ＆詳細フォーム＆Excel出力
         right_pane = tk.Frame(self.paned, bg=LightPalette.BG_PANEL, bd=1, relief=tk.SOLID)
         self.paned.add(right_pane, weight=6)
         self._build_right_bom_pane(right_pane)
 
     def _build_left_preview_pane(self, parent: tk.Frame) -> None:
-        # 1. 読み込み図面リストセクション
         doc_frame = tk.Frame(parent, bg=LightPalette.BG_SUB, padx=8, pady=6)
         doc_frame.pack(fill=tk.X)
 
-        top_lbl_bar = tk.Frame(doc_frame, bg=LightPalette.BG_SUB)
-        top_lbl_bar.pack(fill=tk.X)
-        tk.Label(
-            top_lbl_bar,
-            text="■ 読み込み済み 2D図面一覧 (PDF / DXF)",
-            bg=LightPalette.BG_SUB,
-            fg=LightPalette.FG_ACCENT,
-            font=("Meiryo UI", 9, "bold"),
-        ).pack(side=tk.LEFT)
+        top_bar = tk.Frame(doc_frame, bg=LightPalette.BG_SUB)
+        top_bar.pack(fill=tk.X)
+        tk.Label(top_bar, text="■ 読み込み済み 2D図面一覧", bg=LightPalette.BG_SUB, fg=LightPalette.FG_ACCENT, font=("Meiryo UI", 9, "bold")).pack(side=tk.LEFT)
 
-        tk.Button(
-            top_lbl_bar,
-            text="一覧クリア",
-            command=self.action_clear_documents,
-            bg=LightPalette.BTN_DEFAULT_BG,
-            fg=LightPalette.FG_SUB,
-            relief=tk.SOLID,
-            bd=1,
-            padx=8,
-            pady=1,
-            font=("Meiryo UI", 8),
-        ).pack(side=tk.RIGHT, padx=2)
+        tk.Button(top_bar, text="一覧クリア", command=self.action_clear_documents, bg="#FFFFFF", relief=tk.SOLID, bd=1, padx=6, font=("Meiryo UI", 8)).pack(side=tk.RIGHT, padx=2)
+        tk.Button(top_bar, text="全図面をAI一括解析", command=self.action_ai_analyze_all_docs, bg=LightPalette.BTN_AI_BG, fg="#FFFFFF", relief=tk.FLAT, padx=8, font=("Meiryo UI", 8, "bold"), cursor="hand2").pack(side=tk.RIGHT, padx=3)
+        tk.Button(top_bar, text="AI図面解析 (Gemini)", command=self.action_ai_analyze_current_page, bg="#6D28D9", fg="#FFFFFF", relief=tk.FLAT, padx=8, font=("Meiryo UI", 8, "bold"), cursor="hand2").pack(side=tk.RIGHT, padx=3)
 
-        tk.Button(
-            top_lbl_bar,
-            text="現在図面を再解析",
-            command=self.action_reparse_current_page,
-            bg=LightPalette.BTN_DEFAULT_BG,
-            fg=LightPalette.FG_ACCENT,
-            relief=tk.SOLID,
-            bd=1,
-            padx=8,
-            pady=1,
-            font=("Meiryo UI", 8, "bold"),
-        ).pack(side=tk.RIGHT, padx=4)
-
-        list_container = tk.Frame(doc_frame, bg=LightPalette.BG_PANEL)
-        list_container.pack(fill=tk.X, pady=(4, 0))
-
-        self.doc_listbox = tk.Listbox(
-            list_container,
-            height=4,
-            bg="#FFFFFF",
-            fg=LightPalette.FG_MAIN,
-            selectbackground=LightPalette.BG_SELECTED,
-            selectforeground=LightPalette.FG_ACCENT,
-            font=("Meiryo UI", 9),
-            relief=tk.SOLID,
-            bd=1,
-            exportselection=False,
-        )
-        doc_scroll = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.doc_listbox.yview)
-        self.doc_listbox.configure(yscrollcommand=doc_scroll.set)
+        list_c = tk.Frame(doc_frame, bg=LightPalette.BG_PANEL)
+        list_c.pack(fill=tk.X, pady=(4, 0))
+        self.doc_listbox = tk.Listbox(list_c, height=4, bg="#FFFFFF", fg=LightPalette.FG_MAIN, selectbackground=LightPalette.BG_SELECTED, selectforeground=LightPalette.FG_ACCENT, font=("Meiryo UI", 9), relief=tk.SOLID, bd=1, exportselection=False)
+        sb = ttk.Scrollbar(list_c, orient=tk.VERTICAL, command=self.doc_listbox.yview)
+        self.doc_listbox.configure(yscrollcommand=sb.set)
         self.doc_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        doc_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.doc_listbox.bind("<<ListboxSelect>>", self._on_select_document)
 
-        # 2. プレビュー操作ツールバー
-        ctrl_bar = tk.Frame(parent, bg=LightPalette.BG_PANEL, padx=8, pady=6)
+        ai_bar = tk.Frame(parent, bg="#F5F3FF", padx=8, pady=4, bd=1, relief=tk.SOLID)
+        ai_bar.pack(fill=tk.X, padx=0, pady=(0, 2))
+        tk.Label(ai_bar, text="Geminiモデル:", bg="#F5F3FF", fg="#5B21B6", font=("Meiryo UI", 8, "bold")).pack(side=tk.LEFT)
+        self.quick_model_var = tk.StringVar()
+        self.quick_model_combo = ttk.Combobox(ai_bar, textvariable=self.quick_model_var, state="readonly", width=34)
+        self.quick_model_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+        self.quick_model_combo.bind("<<ComboboxSelected>>", self._on_quick_model_selected)
+        tk.Button(
+            ai_bar, text="★最適選択", command=self.action_select_optimal_model,
+            bg="#EDE9FE", fg="#5B21B6", relief=tk.SOLID, bd=1, padx=6, pady=1, font=("Meiryo UI", 8, "bold"), cursor="hand2"
+        ).pack(side=tk.LEFT, padx=2)
+        tk.Button(
+            ai_bar, text="一覧/設定", command=self.action_open_gemini_settings,
+            bg="#FFFFFF", fg="#1E293B", relief=tk.SOLID, bd=1, padx=6, pady=1, font=("Meiryo UI", 8), cursor="hand2"
+        ).pack(side=tk.LEFT, padx=(2, 0))
+
+        ctrl_bar = tk.Frame(parent, bg=LightPalette.BG_PANEL, padx=8, pady=5)
         ctrl_bar.pack(fill=tk.X)
-
-        # ページ切替
-        self.btn_prev_page = tk.Button(
-            ctrl_bar, text="◀", width=2, command=lambda: self._change_page(-1),
-            bg=LightPalette.BTN_DEFAULT_BG, fg=LightPalette.FG_MAIN, relief=tk.SOLID, bd=1
-        )
-        self.btn_prev_page.pack(side=tk.LEFT)
-
-        self.page_info_lbl = tk.Label(ctrl_bar, text="Page: 0 / 0", bg=LightPalette.BG_PANEL, fg=LightPalette.FG_MAIN, width=11, font=("Meiryo UI", 8, "bold"))
+        tk.Button(ctrl_bar, text="◀", width=2, command=lambda: self._change_page(-1), bg="#FFFFFF", relief=tk.SOLID, bd=1).pack(side=tk.LEFT)
+        self.page_info_lbl = tk.Label(ctrl_bar, text="Page: 0 / 0", width=11, font=("Meiryo UI", 8, "bold"))
         self.page_info_lbl.pack(side=tk.LEFT, padx=2)
+        tk.Button(ctrl_bar, text="▶", width=2, command=lambda: self._change_page(1), bg="#FFFFFF", relief=tk.SOLID, bd=1).pack(side=tk.LEFT, padx=(0, 6))
 
-        self.btn_next_page = tk.Button(
-            ctrl_bar, text="▶", width=2, command=lambda: self._change_page(1),
-            bg=LightPalette.BTN_DEFAULT_BG, fg=LightPalette.FG_MAIN, relief=tk.SOLID, bd=1
-        )
-        self.btn_next_page.pack(side=tk.LEFT, padx=(0, 8))
-
-        # ズーム操作
-        tk.Button(
-            ctrl_bar, text="－", width=2, command=lambda: self._zoom_by(0.8),
-            bg=LightPalette.BTN_DEFAULT_BG, fg=LightPalette.FG_MAIN, relief=tk.SOLID, bd=1
-        ).pack(side=tk.LEFT)
-        self.zoom_lbl = tk.Label(ctrl_bar, text="100%", bg=LightPalette.BG_PANEL, fg=LightPalette.FG_MAIN, width=6, font=("Meiryo UI", 8))
+        tk.Button(ctrl_bar, text="－", width=2, command=lambda: self._zoom_by(0.8), bg="#FFFFFF", relief=tk.SOLID, bd=1).pack(side=tk.LEFT)
+        self.zoom_lbl = tk.Label(ctrl_bar, text="100%", width=6, font=("Meiryo UI", 8))
         self.zoom_lbl.pack(side=tk.LEFT)
-        tk.Button(
-            ctrl_bar, text="＋", width=2, command=lambda: self._zoom_by(1.25),
-            bg=LightPalette.BTN_DEFAULT_BG, fg=LightPalette.FG_MAIN, relief=tk.SOLID, bd=1
-        ).pack(side=tk.LEFT)
-        tk.Button(
-            ctrl_bar, text="全体フィット", command=self._fit_canvas_view,
-            bg=LightPalette.BTN_DEFAULT_BG, fg=LightPalette.FG_MAIN, relief=tk.SOLID, bd=1, padx=6, font=("Meiryo UI", 8)
-        ).pack(side=tk.LEFT, padx=4)
+        tk.Button(ctrl_bar, text="＋", width=2, command=lambda: self._zoom_by(1.25), bg="#FFFFFF", relief=tk.SOLID, bd=1).pack(side=tk.LEFT)
+        tk.Button(ctrl_bar, text="全体フィット", command=self._fit_canvas_view, bg="#FFFFFF", relief=tk.SOLID, bd=1, padx=6, font=("Meiryo UI", 8)).pack(side=tk.LEFT, padx=4)
 
-        # モード切替ボタン（パン移動 vs 矩形範囲選択して部品抽出）
-        self.btn_mode_select = tk.Button(
-            ctrl_bar,
-            text="範囲選択して部品抽出: OFF",
-            command=self._toggle_interaction_mode,
-            bg=LightPalette.BTN_DEFAULT_BG,
-            fg=LightPalette.FG_ACCENT,
-            relief=tk.SOLID,
-            bd=1,
-            padx=8,
-            pady=2,
-            font=("Meiryo UI", 8, "bold"),
-            cursor="hand2",
-        )
+        self.btn_mode_select = tk.Button(ctrl_bar, text="範囲選択して部品抽出: OFF", command=self._toggle_interaction_mode, bg="#FFFFFF", fg=LightPalette.FG_ACCENT, relief=tk.SOLID, bd=1, padx=8, pady=2, font=("Meiryo UI", 8, "bold"), cursor="hand2")
         self.btn_mode_select.pack(side=tk.RIGHT)
 
-        # ガイドバー
-        self.preview_hint_lbl = tk.Label(
+        tk.Label(
             parent,
-            text="操作ヒント: マウスホイールで拡大縮小、左ドラッグで図面移動。「範囲選択して部品抽出」をONにすると、囲んだ範囲から部品を読み取ります。",
-            bg="#EFF6FF",
-            fg="#1E40AF",
-            font=("Meiryo UI", 8),
-            anchor="w",
-            padx=8,
-            pady=4,
-        )
-        self.preview_hint_lbl.pack(fill=tk.X)
+            text="ヒント: 「AI図面解析 (Gemini)」で画像＋文字のハイブリッドAI解析を実行。範囲選択ONで囲むと選択箇所をピンポイントAI抽出します。",
+            bg="#F3E8FF", fg="#5B21B6", font=("Meiryo UI", 8), anchor="w", padx=8, pady=4
+        ).pack(fill=tk.X)
 
-        # 3. 2D図面プレビューキャンバス
-        canvas_container = tk.Frame(parent, bg=LightPalette.BG_CANVAS)
-        canvas_container.pack(fill=tk.BOTH, expand=True)
-
-        self.preview_canvas = tk.Canvas(
-            canvas_container,
-            bg=LightPalette.BG_CANVAS,
-            highlightthickness=0,
-            cursor="fleur",
-        )
+        self.preview_canvas = tk.Canvas(parent, bg=LightPalette.BG_CANVAS, highlightthickness=0, cursor="fleur")
         self.preview_canvas.pack(fill=tk.BOTH, expand=True)
-
-        # キャンバスイベント
         self.preview_canvas.bind("<Configure>", lambda _e: self._redraw_canvas())
         self.preview_canvas.bind("<ButtonPress-1>", self._on_canvas_mouse_down)
         self.preview_canvas.bind("<B1-Motion>", self._on_canvas_mouse_move)
         self.preview_canvas.bind("<ButtonRelease-1>", self._on_canvas_mouse_up)
-        self.preview_canvas.bind("<MouseWheel>", self._on_canvas_mouse_wheel)
+        self.preview_canvas.bind("<Button-3>", self._on_canvas_right_click)
+        self.preview_canvas.bind("<MouseWheel>", lambda e: self._zoom_by(1.15 if e.delta > 0 else 0.85))
 
     def _build_right_bom_pane(self, parent: tk.Frame) -> None:
-        # 1. プロジェクト・図面ヘッダー情報欄
         meta_bar = tk.Frame(parent, bg=LightPalette.BG_SUB, padx=10, pady=8)
         meta_bar.pack(fill=tk.X)
-
-        tk.Label(meta_bar, text="案件名/製品名:", bg=LightPalette.BG_SUB, fg=LightPalette.FG_MAIN, font=("Meiryo UI", 9, "bold")).grid(row=0, column=0, sticky="w")
+        tk.Label(meta_bar, text="案件名/製品名:", bg=LightPalette.BG_SUB, font=("Meiryo UI", 9, "bold")).grid(row=0, column=0, sticky="w")
         self.proj_name_var = tk.StringVar(value=self.excel_config.project_name)
-        ttk.Entry(meta_bar, textvariable=self.proj_name_var, width=26).grid(row=0, column=1, padx=(4, 12), sticky="w")
+        ttk.Entry(meta_bar, textvariable=self.proj_name_var, width=24).grid(row=0, column=1, padx=(4, 10))
 
-        tk.Label(meta_bar, text="総合図番:", bg=LightPalette.BG_SUB, fg=LightPalette.FG_MAIN, font=("Meiryo UI", 9, "bold")).grid(row=0, column=2, sticky="w")
+        tk.Label(meta_bar, text="総合図番:", bg=LightPalette.BG_SUB, font=("Meiryo UI", 9, "bold")).grid(row=0, column=2, sticky="w")
         self.dwg_no_var = tk.StringVar(value=self.excel_config.drawing_no)
-        ttk.Entry(meta_bar, textvariable=self.dwg_no_var, width=16).grid(row=0, column=3, padx=(4, 12), sticky="w")
+        ttk.Entry(meta_bar, textvariable=self.dwg_no_var, width=15).grid(row=0, column=3, padx=(4, 10))
 
-        tk.Label(meta_bar, text="作成者:", bg=LightPalette.BG_SUB, fg=LightPalette.FG_MAIN, font=("Meiryo UI", 9, "bold")).grid(row=0, column=4, sticky="w")
-        self.author_var = tk.StringVar(value=self.excel_config.author_name)
-        ttk.Entry(meta_bar, textvariable=self.author_var, width=14).grid(row=0, column=5, padx=(4, 12), sticky="w")
+        tk.Label(meta_bar, text="作成者:", bg=LightPalette.BG_SUB, font=("Meiryo UI", 9, "bold")).grid(row=0, column=4, sticky="w")
+        self.author_var = tk.StringVar(value="")
+        ttk.Entry(meta_bar, textvariable=self.author_var, width=12).grid(row=0, column=5, padx=(4, 10))
 
-        tk.Label(meta_bar, text="検索フィルタ:", bg=LightPalette.BG_SUB, fg=LightPalette.FG_ACCENT, font=("Meiryo UI", 9, "bold")).grid(row=0, column=6, sticky="w")
+        tk.Label(meta_bar, text="検索:", bg=LightPalette.BG_SUB, fg=LightPalette.FG_ACCENT, font=("Meiryo UI", 9, "bold")).grid(row=0, column=6, sticky="w")
         self.filter_var = tk.StringVar(value="")
         self.filter_var.trace_add("write", lambda *_: self._refresh_treeview())
-        ttk.Entry(meta_bar, textvariable=self.filter_var, width=18).grid(row=0, column=7, padx=(4, 4), sticky="w")
+        ttk.Entry(meta_bar, textvariable=self.filter_var, width=16).grid(row=0, column=7, padx=4)
 
-        # 2. 部品表編集ツールバー
-        tool_bar = tk.Frame(parent, bg=LightPalette.BG_PANEL, padx=8, pady=6)
+        tool_bar = tk.Frame(parent, bg=LightPalette.BG_PANEL, padx=8, pady=5)
         tool_bar.pack(fill=tk.X)
+        self._tool_btn(tool_bar, "＋ 行追加", self.action_add_row, "#1D4ED8", True)
+        self._tool_btn(tool_bar, "行複製", self.action_duplicate_row)
+        self._tool_btn(tool_bar, "－ 行削除", self.action_delete_rows, "#DC2626")
+        self._tool_btn(tool_bar, "↑", lambda: self.action_move_row(-1))
+        self._tool_btn(tool_bar, "↓", lambda: self.action_move_row(1))
+        self._tool_btn(tool_bar, "No.振直", self.action_renumber_rows)
+        self._tool_btn(tool_bar, "重複名寄せ統合", self.action_merge_duplicates, "#047857", True)
+        self._tool_btn(tool_bar, "寸法から重量計算", self.action_auto_calc_weights, "#1D4ED8")
+        self._tool_btn(tool_bar, "重量計算機", self.action_open_weight_calculator, "#7C3AED", True)
+        self._tool_btn(tool_bar, "AIデータ補正・補完", self.action_ai_refine_bom, "#6D28D9", True)
+        self._tool_btn(tool_bar, "Excel貼付コピー", self.action_copy_selected_to_clipboard, "#0F766E")
+        self._tool_btn(tool_bar, "Undo", self.action_undo)
+        self._tool_btn(tool_bar, "Redo", self.action_redo)
+        self._tool_btn(tool_bar, "全クリア", self.action_clear_all_parts, "#64748B")
 
-        self._create_tool_btn(tool_bar, "＋ 行追加", self.action_add_row, fg="#1D4ED8", bold=True)
-        self._create_tool_btn(tool_bar, "行複製", self.action_duplicate_row)
-        self._create_tool_btn(tool_bar, "－ 行削除", self.action_delete_rows, fg="#DC2626")
-        self._create_tool_btn(tool_bar, "↑ 上へ", lambda: self.action_move_row(-1))
-        self._create_tool_btn(tool_bar, "↓ 下へ", lambda: self.action_move_row(1))
-        self._create_tool_btn(tool_bar, "No.連番振直", self.action_renumber_rows)
-        self._create_tool_btn(tool_bar, "重複部品の名寄せ統合", self.action_merge_duplicates, fg="#047857", bold=True)
-        self._create_tool_btn(tool_bar, "寸法から重量自動計算", self.action_auto_calc_weights, fg="#1D4ED8")
-        self._create_tool_btn(tool_bar, "重量計算機...", self.action_open_weight_calculator, fg="#7C3AED", bold=True)
-        self._create_tool_btn(tool_bar, "元に戻す(Undo)", self.action_undo)
-        self._create_tool_btn(tool_bar, "やり直す(Redo)", self.action_redo)
-        self._create_tool_btn(tool_bar, "全クリア", self.action_clear_all_parts, fg="#64748B")
-
-        # 3. 部品表 (Treeview)
-        table_container = tk.Frame(parent, bg=LightPalette.BG_PANEL, padx=8)
-        table_container.pack(fill=tk.BOTH, expand=True)
-
-        self.tree = ttk.Treeview(
-            table_container,
-            columns=self.TREE_COLUMNS,
-            show="headings",
-            selectmode="extended",
-        )
-        y_scroll = ttk.Scrollbar(table_container, orient=tk.VERTICAL, command=self.tree.yview)
-        x_scroll = ttk.Scrollbar(table_container, orient=tk.HORIZONTAL, command=self.tree.xview)
-        self.tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
-
-        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        tc = tk.Frame(parent, bg=LightPalette.BG_PANEL, padx=8)
+        tc.pack(fill=tk.BOTH, expand=True)
+        self.tree = ttk.Treeview(tc, columns=self.TREE_COLUMNS, show="headings", selectmode="extended")
+        ys = ttk.Scrollbar(tc, orient=tk.VERTICAL, command=self.tree.yview)
+        xs = ttk.Scrollbar(tc, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        ys.pack(side=tk.RIGHT, fill=tk.Y)
+        xs.pack(side=tk.BOTTOM, fill=tk.X)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         col_defs = [
-            ("item_no", "No.", 46, "center"),
-            ("part_number", "図番 / 品番", 115, "w"),
-            ("part_name", "品名 / 部品名称", 155, "w"),
-            ("specification", "型式・寸法・仕様", 145, "w"),
-            ("material", "材質", 85, "center"),
-            ("treatment", "表面処理・熱処理", 125, "w"),
-            ("quantity", "数量", 58, "e"),
-            ("unit", "単位", 48, "center"),
-            ("unit_weight", "単重(kg)", 72, "e"),
-            ("total_weight", "総重量(kg)", 78, "e"),
-            ("category", "調達区分", 85, "center"),
-            ("manufacturer", "メーカー", 105, "w"),
-            ("unit_price", "単価(円)", 78, "e"),
-            ("amount", "金額(円)", 88, "e"),
-            ("source_file", "抽出元図面", 115, "w"),
-            ("remarks", "備考", 140, "w"),
+            ("item_no", "No.", 44, "center"), ("part_number", "図番 / 品番", 115, "w"),
+            ("part_name", "品名 / 部品名称", 150, "w"), ("specification", "型式・寸法・仕様", 145, "w"),
+            ("material", "材質", 82, "center"), ("treatment", "表面処理・熱処理", 125, "w"),
+            ("quantity", "数量", 55, "e"), ("unit", "単位", 46, "center"),
+            ("unit_weight", "単重(kg)", 70, "e"), ("total_weight", "総重量(kg)", 76, "e"),
+            ("category", "調達区分", 84, "center"), ("manufacturer", "メーカー", 100, "w"),
+            ("unit_price", "単価(円)", 75, "e"), ("amount", "金額(円)", 85, "e"),
+            ("source_file", "抽出元図面", 110, "w"), ("remarks", "備考", 130, "w"),
         ]
-        for cid, heading_txt, width_px, anchor_pos in col_defs:
-            self.tree.heading(cid, text=heading_txt, command=lambda c=cid: self._sort_tree_by_column(c))
-            self.tree.column(cid, width=width_px, minwidth=40, anchor=anchor_pos)
-
-        self.tree.tag_configure("even", background=LightPalette.BG_ROW_EVEN, foreground=LightPalette.FG_MAIN)
-        self.tree.tag_configure("odd", background=LightPalette.BG_ROW_ODD, foreground=LightPalette.FG_MAIN)
-
+        for cid, h_txt, w_px, anc in col_defs:
+            self.tree.heading(cid, text=h_txt, command=lambda c=cid: self._sort_tree_by_column(c))
+            self.tree.column(cid, width=w_px, minwidth=38, anchor=anc)
+        self.tree.tag_configure("even", background=LightPalette.BG_ROW_EVEN)
+        self.tree.tag_configure("odd", background=LightPalette.BG_ROW_ODD)
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<Double-1>", self._on_tree_double_click)
+        self.tree.bind("<Button-3>", self._on_tree_right_click)
+        self._init_context_menus()
 
-        # 4. 選択行の詳細編集フォーム
-        form_frame = ttk.LabelFrame(parent, text=" 選択行の詳細編集 (ダブルクリックでも表内で直接編集できます) ", padding=(10, 6))
-        form_frame.pack(fill=tk.X, padx=8, pady=6)
-        self._build_detail_form(form_frame)
+        form_f = ttk.LabelFrame(parent, text=" 選択行の詳細編集 (表のセルをダブルクリックしても直接編集できます) ", padding=(10, 5))
+        form_f.pack(fill=tk.X, padx=8, pady=5)
+        self._build_detail_form(form_f)
 
-        # 5. 下部集計サマリー＆Excel出力フッター
-        footer = tk.Frame(parent, bg=LightPalette.BG_SUB, padx=12, pady=10, bd=1, relief=tk.SOLID)
+        footer = tk.Frame(parent, bg=LightPalette.BG_SUB, padx=12, pady=9, bd=1, relief=tk.SOLID)
         footer.pack(fill=tk.X, padx=8, pady=(0, 8))
-
-        self.summary_lbl = tk.Label(
-            footer,
-            text="総部品行数: 0 件   |   総個数: 0   |   総重量: 0.000 kg   |   合計金額: ¥0",
-            bg=LightPalette.BG_SUB,
-            fg=LightPalette.FG_MAIN,
-            font=("Meiryo UI", 10, "bold"),
-        )
+        self.summary_lbl = tk.Label(footer, text="総部品行数: 0 件 | 総個数: 0 | 総重量: 0.000 kg | 合計金額: ¥0", bg=LightPalette.BG_SUB, font=("Meiryo UI", 10, "bold"))
         self.summary_lbl.pack(side=tk.LEFT)
 
-        # 出力ボタン群
-        tk.Button(
-            footer,
-            text="Excel部品表を出力 (.xlsx)",
-            command=self.action_export_excel,
-            bg=LightPalette.BTN_SUCCESS_BG,
-            fg=LightPalette.BTN_SUCCESS_FG,
-            activebackground=LightPalette.BTN_SUCCESS_ACTIVE,
-            activeforeground=LightPalette.BTN_SUCCESS_FG,
-            relief=tk.FLAT,
-            padx=20,
-            pady=7,
-            font=("Meiryo UI", 10, "bold"),
-            cursor="hand2",
-        ).pack(side=tk.RIGHT, padx=(6, 0))
+        tk.Button(footer, text="Excel部品表を出力 (.xlsx)", command=self.action_export_excel, bg=LightPalette.BTN_SUCCESS_BG, fg="#FFFFFF", relief=tk.FLAT, padx=18, pady=6, font=("Meiryo UI", 10, "bold"), cursor="hand2").pack(side=tk.RIGHT, padx=(6, 0))
+        tk.Button(footer, text="Excel出力設定...", command=self.action_open_excel_settings, bg="#FFFFFF", fg=LightPalette.FG_ACCENT, relief=tk.SOLID, bd=1, padx=10, pady=5, font=("Meiryo UI", 9, "bold")).pack(side=tk.RIGHT, padx=4)
+        tk.Button(footer, text="CSV出力 (.csv)", command=self.action_export_csv, bg="#FFFFFF", relief=tk.SOLID, bd=1, padx=10, pady=5, font=("Meiryo UI", 9)).pack(side=tk.RIGHT, padx=4)
 
-        tk.Button(
-            footer,
-            text="Excel出力設定...",
-            command=self.action_open_excel_settings,
-            bg=LightPalette.BTN_DEFAULT_BG,
-            fg=LightPalette.FG_ACCENT,
-            relief=tk.SOLID,
-            bd=1,
-            padx=12,
-            pady=6,
-            font=("Meiryo UI", 9, "bold"),
-            cursor="hand2",
-        ).pack(side=tk.RIGHT, padx=4)
-
-        tk.Button(
-            footer,
-            text="CSV出力 (.csv)",
-            command=self.action_export_csv,
-            bg=LightPalette.BTN_DEFAULT_BG,
-            fg=LightPalette.FG_MAIN,
-            relief=tk.SOLID,
-            bd=1,
-            padx=12,
-            pady=6,
-            font=("Meiryo UI", 9),
-            cursor="hand2",
-        ).pack(side=tk.RIGHT, padx=4)
-
-    def _create_tool_btn(
-        self, parent: tk.Misc, text: str, command: Any, fg: str = LightPalette.FG_MAIN, bold: bool = False
-    ) -> tk.Button:
-        font_spec = ("Meiryo UI", 8, "bold") if bold else ("Meiryo UI", 8)
-        btn = tk.Button(
-            parent,
-            text=text,
-            command=command,
-            bg=LightPalette.BTN_DEFAULT_BG,
-            fg=fg,
-            activebackground=LightPalette.BTN_DEFAULT_ACTIVE,
-            relief=tk.SOLID,
-            bd=1,
-            padx=7,
-            pady=3,
-            font=font_spec,
-            cursor="hand2",
-        )
-        btn.pack(side=tk.LEFT, padx=2)
-        return btn
+    def _tool_btn(self, parent: tk.Misc, text: str, cmd: Any, fg: str = LightPalette.FG_MAIN, bold: bool = False) -> tk.Button:
+        b = tk.Button(parent, text=text, command=cmd, bg="#FFFFFF", fg=fg, relief=tk.SOLID, bd=1, padx=6, pady=3, font=("Meiryo UI", 8, "bold") if bold else ("Meiryo UI", 8), cursor="hand2")
+        b.pack(side=tk.LEFT, padx=2)
+        return b
 
     def _build_detail_form(self, parent: ttk.LabelFrame) -> None:
-        self.form_vars: Dict[str, tk.StringVar] = {
-            k: tk.StringVar(value="")
-            for k in [
-                "item_no", "part_number", "part_name", "specification",
-                "material", "treatment", "quantity", "unit",
-                "unit_weight", "category", "manufacturer", "unit_price", "remarks"
-            ]
-        }
+        keys = ["item_no", "part_number", "part_name", "specification", "material", "treatment", "quantity", "unit", "unit_weight", "category", "manufacturer", "unit_price", "remarks"]
+        self.form_vars: Dict[str, tk.StringVar] = {k: tk.StringVar(value="") for k in keys}
 
-        # 1段目
         r0 = tk.Frame(parent, bg=LightPalette.BG_PANEL)
         r0.pack(fill=tk.X, pady=2)
+        self._f_ent(r0, "No:", "item_no", 5)
+        self._f_ent(r0, "図番/品番:", "part_number", 15)
+        self._f_ent(r0, "品名:", "part_name", 20)
+        self._f_ent(r0, "型式・寸法:", "specification", 18)
+        self._f_cmb(r0, "材質:", "material", list(MATERIAL_MASTER.keys()), 10)
+        self._f_cmb(r0, "表面処理:", "treatment", SURFACE_TREATMENTS, 15)
 
-        self._add_form_field(r0, "No:", "item_no", width=5)
-        self._add_form_field(r0, "図番/品番:", "part_number", width=16)
-        self._add_form_field(r0, "品名:", "part_name", width=22)
-        self._add_form_field(r0, "型式・寸法:", "specification", width=20)
-        self._add_form_combo(r0, "材質:", "material", list(MATERIAL_MASTER.keys()), width=11)
-        self._add_form_combo(r0, "表面処理:", "treatment", SURFACE_TREATMENTS, width=16)
-
-        # 2段目
         r1 = tk.Frame(parent, bg=LightPalette.BG_PANEL)
-        r1.pack(fill=tk.X, pady=3)
+        r1.pack(fill=tk.X, pady=2)
+        self._f_ent(r1, "数量:", "quantity", 6)
+        self._f_cmb(r1, "単位:", "unit", UNITS, 5)
+        self._f_ent(r1, "単重(kg):", "unit_weight", 8)
+        self._f_cmb(r1, "区分:", "category", CATEGORIES, 9)
+        self._f_ent(r1, "メーカー:", "manufacturer", 12)
+        self._f_ent(r1, "単価(円):", "unit_price", 8)
+        self._f_ent(r1, "備考:", "remarks", 15)
+        tk.Button(r1, text="選択行を更新", command=self.action_apply_detail_form, bg=LightPalette.BTN_PRIMARY_BG, fg="#FFFFFF", relief=tk.FLAT, padx=10, pady=3, font=("Meiryo UI", 8, "bold")).pack(side=tk.RIGHT, padx=4)
 
-        self._add_form_field(r1, "数量:", "quantity", width=7)
-        self._add_form_combo(r1, "単位:", "unit", UNITS, width=6)
-        self._add_form_field(r1, "単重(kg):", "unit_weight", width=9)
-        self._add_form_combo(r1, "区分:", "category", CATEGORIES, width=10)
-        self._add_form_field(r1, "メーカー:", "manufacturer", width=13)
-        self._add_form_field(r1, "単価(円):", "unit_price", width=9)
-        self._add_form_field(r1, "備考:", "remarks", width=16)
+    def _f_ent(self, row_f: tk.Frame, lbl: str, key: str, w: int) -> None:
+        tk.Label(row_f, text=lbl, bg=LightPalette.BG_PANEL, fg=LightPalette.FG_SUB, font=("Meiryo UI", 8, "bold")).pack(side=tk.LEFT, padx=(3, 1))
+        e = ttk.Entry(row_f, textvariable=self.form_vars[key], width=w)
+        e.pack(side=tk.LEFT, padx=(0, 5))
+        e.bind("<Return>", lambda _e: self.action_apply_detail_form())
 
-        tk.Button(
-            r1,
-            text="選択行を更新 (Enter)",
-            command=self.action_apply_detail_form,
-            bg=LightPalette.BTN_PRIMARY_BG,
-            fg=LightPalette.BTN_PRIMARY_FG,
-            activebackground=LightPalette.BTN_PRIMARY_ACTIVE,
-            activeforeground=LightPalette.BTN_PRIMARY_FG,
-            relief=tk.FLAT,
-            padx=12,
-            pady=3,
-            font=("Meiryo UI", 8, "bold"),
-            cursor="hand2",
-        ).pack(side=tk.RIGHT, padx=4)
-
-    def _add_form_field(self, row_frame: tk.Frame, label_txt: str, key: str, width: int) -> None:
-        tk.Label(row_frame, text=label_txt, bg=LightPalette.BG_PANEL, fg=LightPalette.FG_SUB, font=("Meiryo UI", 8, "bold")).pack(side=tk.LEFT, padx=(4, 2))
-        ent = ttk.Entry(row_frame, textvariable=self.form_vars[key], width=width)
-        ent.pack(side=tk.LEFT, padx=(0, 6))
-        ent.bind("<Return>", lambda _e: self.action_apply_detail_form())
-
-    def _add_form_combo(self, row_frame: tk.Frame, label_txt: str, key: str, values: List[str], width: int) -> None:
-        tk.Label(row_frame, text=label_txt, bg=LightPalette.BG_PANEL, fg=LightPalette.FG_SUB, font=("Meiryo UI", 8, "bold")).pack(side=tk.LEFT, padx=(4, 2))
-        cb = ttk.Combobox(row_frame, textvariable=self.form_vars[key], values=values, width=width)
-        cb.pack(side=tk.LEFT, padx=(0, 6))
-        cb.bind("<Return>", lambda _e: self.action_apply_detail_form())
+    def _f_cmb(self, row_f: tk.Frame, lbl: str, key: str, vals: List[str], w: int) -> None:
+        tk.Label(row_f, text=lbl, bg=LightPalette.BG_PANEL, fg=LightPalette.FG_SUB, font=("Meiryo UI", 8, "bold")).pack(side=tk.LEFT, padx=(3, 1))
+        c = ttk.Combobox(row_f, textvariable=self.form_vars[key], values=vals, width=w)
+        c.pack(side=tk.LEFT, padx=(0, 5))
+        c.bind("<Return>", lambda _e: self.action_apply_detail_form())
 
     def _build_statusbar(self) -> None:
-        status_frame = tk.Frame(self.root, bg="#E2E8F0", padx=12, pady=4)
-        status_frame.pack(fill=tk.X, side=tk.BOTTOM)
-
-        self.status_var = tk.StringVar(
-            value="準備完了: 「図面ファイルを開く (PDF/DXF)」または「サンプル図面で試す」をクリックしてください。"
-        )
-        tk.Label(
-            status_frame,
-            textvariable=self.status_var,
-            bg="#E2E8F0",
-            fg=LightPalette.FG_MAIN,
-            font=("Meiryo UI", 8),
-            anchor="w",
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        tk.Label(
-            status_frame,
-            text=f"{APP_NAME} (Windows 11 Light Mode)",
-            bg="#E2E8F0",
-            fg=LightPalette.FG_MUTED,
-            font=("Meiryo UI", 8),
-        ).pack(side=tk.RIGHT)
+        sf = tk.Frame(self.root, bg="#E2E8F0", padx=12, pady=4)
+        sf.pack(fill=tk.X, side=tk.BOTTOM)
+        self.status_var = tk.StringVar(value="準備完了: 「図面ファイルを開く」または「サンプル図面で試す」をクリックしてください。高精度解析には「Gemini AI設定」をご利用ください。")
+        tk.Label(sf, textvariable=self.status_var, bg="#E2E8F0", fg=LightPalette.FG_MAIN, font=("Meiryo UI", 8), anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(sf, text=f"{APP_NAME} (Windows 11 Light Mode)", bg="#E2E8F0", fg=LightPalette.FG_MUTED, font=("Meiryo UI", 8)).pack(side=tk.RIGHT)
 
     def _bind_shortcuts(self) -> None:
         self.root.bind("<Control-o>", lambda _e: self.action_open_files())
         self.root.bind("<Control-s>", lambda _e: self.action_export_excel())
         self.root.bind("<Control-z>", lambda _e: self.action_undo())
         self.root.bind("<Control-y>", lambda _e: self.action_redo())
-        self.root.bind("<Delete>", self._on_delete_key)
+        self.root.bind("<Control-c>", lambda e: self.action_copy_selected_to_clipboard() if isinstance(e.widget, ttk.Treeview) else None)
+        self.root.bind("<F1>", lambda _e: self.action_show_readme())
+        self.root.bind("<Delete>", lambda e: self.action_delete_rows() if isinstance(e.widget, ttk.Treeview) else None)
 
-    def _on_delete_key(self, event: tk.Event) -> None:
-        if isinstance(event.widget, ttk.Treeview):
-            self.action_delete_rows()
+    def _init_context_menus(self) -> None:
+        self.tree_menu = tk.Menu(self.root, tearoff=0, bg="#FFFFFF", fg=LightPalette.FG_MAIN, activebackground=LightPalette.BG_SELECTED, activeforeground=LightPalette.FG_ACCENT, font=("Meiryo UI", 9))
+        self.tree_menu.add_command(label="＋ 新規行を追加", command=self.action_add_row)
+        self.tree_menu.add_command(label="選択行を複製", command=self.action_duplicate_row)
+        self.tree_menu.add_command(label="－ 選択行を削除 (Delete)", command=self.action_delete_rows)
+        self.tree_menu.add_separator()
+        self.tree_menu.add_command(label="選択行をクリップボードへコピー (Excel貼付用 / Ctrl+C)", command=self.action_copy_selected_to_clipboard)
+        self.tree_menu.add_command(label="重量計算機を開く", command=self.action_open_weight_calculator)
+        self.tree_menu.add_command(label="寸法から重量を一括自動計算", command=self.action_auto_calc_weights)
+        self.tree_menu.add_separator()
+        self.tree_menu.add_command(label="AIデータ補正・補完を実行", command=self.action_ai_refine_bom)
 
-    # --------------------------------------------------------------------------
-    # Undo / Redo 履歴管理
-    # --------------------------------------------------------------------------
+        self.canvas_menu = tk.Menu(self.root, tearoff=0, bg="#FFFFFF", fg=LightPalette.FG_MAIN, activebackground=LightPalette.BG_SELECTED, activeforeground=LightPalette.FG_ACCENT, font=("Meiryo UI", 9))
+        self.canvas_menu.add_command(label="全体フィット表示", command=self._fit_canvas_view)
+        self.canvas_menu.add_command(label="拡大 (＋)", command=lambda: self._zoom_by(1.25))
+        self.canvas_menu.add_command(label="縮小 (－)", command=lambda: self._zoom_by(0.8))
+        self.canvas_menu.add_separator()
+        self.canvas_menu.add_command(label="範囲選択抽出モード ON/OFF 切替", command=self._toggle_interaction_mode)
+        self.canvas_menu.add_command(label="この図面ページを Gemini AI で解析", command=self.action_ai_analyze_current_page)
+
+    def _on_tree_right_click(self, event: tk.Event) -> None:
+        row_id = self.tree.identify_row(event.y)
+        if row_id and row_id not in self.tree.selection():
+            self.tree.selection_set(row_id)
+            self._on_tree_select(event)
+        try:
+            self.tree_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.tree_menu.grab_release()
+
+    def _on_canvas_right_click(self, event: tk.Event) -> None:
+        try:
+            self.canvas_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.canvas_menu.grab_release()
+
+    def action_copy_selected_to_clipboard(self) -> None:
+        if not self.parts:
+            self.set_status("コピーする部品データがありません。")
+            return
+        sel = self.tree.selection()
+        if sel:
+            sel_set = set(sel)
+            targets = [p for p in self.parts if p.uid in sel_set]
+        else:
+            targets = list(self.parts)
+        if not targets:
+            return
+        lines = [
+            "\t".join(["No.", "図番/品番", "品名", "型式・寸法", "材質", "表面処理", "数量", "単位", "単重(kg)", "総重量(kg)", "調達区分", "メーカー", "単価(円)", "金額(円)", "抽出元図面", "備考"])
+        ]
+        for p in targets:
+            lines.append("\t".join([
+                str(p.item_no), str(p.part_number), str(p.part_name), str(p.specification),
+                str(p.material), str(p.treatment), p.formatted_qty(), str(p.unit),
+                f"{p.unit_weight:.3f}", f"{p.total_weight:.3f}", str(p.category),
+                str(p.manufacturer), str(int(p.unit_price)), str(int(p.amount)),
+                str(p.source_file), str(p.remarks),
+            ]))
+        tsv_text = "\n".join(lines)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(tsv_text)
+        self.set_status(f"部品データ {len(targets)} 件をクリップボードにコピーしました（Excel上でそのまま Ctrl+V で貼り付け可能です）。")
+
     def _push_undo_state(self) -> None:
         self.undo_stack.append(copy.deepcopy(self.parts))
         if len(self.undo_stack) > 50:
@@ -3045,90 +3656,220 @@ class PartLensApp:
         self.redo_stack.clear()
 
     def action_undo(self) -> None:
-        if not self.undo_stack:
-            self.set_status("これ以上元に戻す履歴はありません。")
-            return
-        self.redo_stack.append(copy.deepcopy(self.parts))
-        self.parts = self.undo_stack.pop()
-        self._refresh_treeview()
-        self.set_status("直前の操作を元に戻しました (Undo)。")
+        if self.undo_stack:
+            self.redo_stack.append(copy.deepcopy(self.parts))
+            self.parts = self.undo_stack.pop()
+            self._refresh_treeview()
+            self.set_status("直前の操作を元に戻しました (Undo)。")
 
     def action_redo(self) -> None:
-        if not self.redo_stack:
-            self.set_status("やり直す履歴はありません。")
-            return
-        self.undo_stack.append(copy.deepcopy(self.parts))
-        self.parts = self.redo_stack.pop()
-        self._refresh_treeview()
-        self.set_status("操作をやり直しました (Redo)。")
+        if self.redo_stack:
+            self.undo_stack.append(copy.deepcopy(self.parts))
+            self.parts = self.redo_stack.pop()
+            self._refresh_treeview()
+            self.set_status("操作をやり直しました (Redo)。")
 
-    def set_status(self, message: str) -> None:
-        self.status_var.set(message)
+    def set_status(self, msg: str) -> None:
+        self.status_var.set(msg)
         self.root.update_idletasks()
 
     # --------------------------------------------------------------------------
-    # ファイル読込・サンプル図面生成アクション
+    # Gemini AI 高精度図面解析アクション（非同期スレッド実行）
+    # --------------------------------------------------------------------------
+    def action_open_gemini_settings(self) -> None:
+        dlg = GeminiSettingsDialog(self.root, self.gemini_config, self._on_gemini_settings_saved)
+        self.root.wait_window(dlg)
+
+    def _ensure_api_key(self) -> bool:
+        if not self.gemini_config.api_key.strip():
+            if messagebox.askyesno("Gemini APIキー未設定", "Gemini AI解析を使用するにはAPIキーの設定が必要です。\n今すぐ「Gemini AI設定」画面を開きますか？"):
+                self.action_open_gemini_settings()
+            return bool(self.gemini_config.api_key.strip())
+        return True
+
+    def action_ai_analyze_current_page(self) -> None:
+        if self.is_ai_busy:
+            messagebox.showinfo("AI解析中", "現在Gemini AIによる解析処理を実行中です。完了までお待ちください。")
+            return
+        page_data = self._get_current_page()
+        if not page_data or self.current_doc_idx < 0:
+            messagebox.showinfo("図面未選択", "先に図面ファイル (PDF / DXF) を読み込んでください。")
+            return
+        if not self._ensure_api_key():
+            return
+
+        doc = self.documents[self.current_doc_idx]
+        self._run_ai_page_analysis_async([(doc, page_data)], crop_rect=None)
+
+    def action_ai_analyze_all_docs(self) -> None:
+        if self.is_ai_busy:
+            return
+        if not self.documents:
+            messagebox.showinfo("図面未読込", "先に図面ファイルを読み込んでください。")
+            return
+        if not self._ensure_api_key():
+            return
+
+        targets: List[Tuple[DrawingDocument, DrawingPageData]] = []
+        for doc in self.documents:
+            for pg in doc.pages:
+                targets.append((doc, pg))
+        self._run_ai_page_analysis_async(targets, crop_rect=None)
+
+    def _run_ai_page_analysis_async(
+        self,
+        targets: List[Tuple[DrawingDocument, DrawingPageData]],
+        crop_rect: Optional[Tuple[float, float, float, float]] = None,
+    ) -> None:
+        self.is_ai_busy = True
+        self.set_status(f"Gemini AI ({self.gemini_config.model_name}) で図面を高精度解析中... しばらくお待ちください。")
+
+        def worker() -> None:
+            results: List[Tuple[DrawingDocument, DrawingPageData, List[PartItem], Dict[str, str]]] = []
+            err_msg = ""
+            try:
+                for doc, pg in targets:
+                    parts_out, meta_out = GeminiVisionAnalyzer.analyze_drawing_page(
+                        self.gemini_config, pg, doc.file_name, crop_rect=crop_rect
+                    )
+                    results.append((doc, pg, parts_out, meta_out))
+            except Exception as e:
+                err_msg = str(e)
+
+            def on_done() -> None:
+                if not self.root.winfo_exists():
+                    return
+                self.is_ai_busy = False
+                if err_msg:
+                    self.set_status(f"Gemini AI解析エラー: {err_msg}")
+                    messagebox.showerror("Gemini AI解析エラー", f"AI解析中にエラーが発生しました:\n{err_msg}")
+                    return
+
+                self._push_undo_state()
+                total_added = 0
+                for doc, pg, parts_out, meta_out in results:
+                    if meta_out.get("drawing_title"):
+                        doc.drawing_title = meta_out["drawing_title"]
+                        if self.proj_name_var.get() in ("", "新規機械設計プロジェクト"):
+                            self.proj_name_var.set(doc.drawing_title)
+                    if meta_out.get("drawing_number"):
+                        doc.drawing_number = meta_out["drawing_number"]
+                        if self.dwg_no_var.get() in ("", "ASM-0001"):
+                            self.dwg_no_var.set(doc.drawing_number)
+
+                    if crop_rect is None and self.gemini_config.replace_existing_on_ai:
+                        self.parts = [
+                            p for p in self.parts
+                            if not (p.source_file == doc.file_name and p.source_page == pg.page_no)
+                        ]
+                    self.parts.extend(parts_out)
+                    doc.extracted_count = sum(1 for p in self.parts if p.source_file == doc.file_name)
+                    total_added += len(parts_out)
+
+                self._refresh_document_listbox()
+                self.action_renumber_rows(push_undo=False)
+                if crop_rect is not None:
+                    self.highlight_bbox = crop_rect
+                self._redraw_canvas()
+                self.set_status(f"Gemini AI解析完了！ {total_added} 件の部品データを高精度抽出しました。")
+
+            self.root.after(0, on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def action_ai_refine_bom(self) -> None:
+        if self.is_ai_busy:
+            return
+        if not self.parts:
+            messagebox.showinfo("データなし", "補正する部品表データがありません。")
+            return
+        if not self._ensure_api_key():
+            return
+
+        self.is_ai_busy = True
+        self.set_status(f"Gemini AI ({self.gemini_config.model_name}) で部品表データの規格正規化・単重/メーカー補完を実行中...")
+        snapshot = copy.deepcopy(self.parts)
+
+        def worker() -> None:
+            err_msg = ""
+            refined: List[PartItem] = []
+            try:
+                refined = GeminiVisionAnalyzer.refine_bom_parts(self.gemini_config, snapshot)
+            except Exception as e:
+                err_msg = str(e)
+
+            def on_done() -> None:
+                if not self.root.winfo_exists():
+                    return
+                self.is_ai_busy = False
+                if err_msg:
+                    self.set_status(f"AI補正エラー: {err_msg}")
+                    messagebox.showerror("AIデータ補正エラー", f"AI補正中にエラーが発生しました:\n{err_msg}")
+                    return
+                self._push_undo_state()
+                self.parts = refined
+                self._refresh_treeview()
+                self.set_status("Gemini AIによる部品表データの正規化・単重/メーカー/区分補完が完了しました！")
+
+            self.root.after(0, on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # --------------------------------------------------------------------------
+    # ファイル読込・サンプル生成
     # --------------------------------------------------------------------------
     def action_open_files(self) -> None:
         paths = filedialog.askopenfilenames(
-            title="2D図面ファイル (PDF / DXF) を選択",
+            title="2D図面ファイル (PDF / DXF / 画像) を選択",
             filetypes=[
-                ("2D図面ファイル (*.pdf;*.dxf)", "*.pdf *.dxf"),
-                ("PDF図面ファイル (*.pdf)", "*.pdf"),
-                ("CAD DXF図面ファイル (*.dxf)", "*.dxf"),
-                ("すべてのファイル (*.*)", "*.*"),
+                ("対応2D図面すべて (*.pdf;*.dxf;*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff;*.webp)", "*.pdf *.dxf *.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp"),
+                ("PDF図面 (*.pdf)", "*.pdf"),
+                ("CAD DXF図面 (*.dxf)", "*.dxf"),
+                ("画像図面 (*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff;*.webp)", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp"),
             ],
         )
         if paths:
             self._load_drawing_files(list(paths))
 
     def action_open_folder(self) -> None:
-        folder = filedialog.askdirectory(title="図面ファイルが入ったフォルダを選択")
+        folder = filedialog.askdirectory(title="図面フォルダを選択")
         if not folder:
             return
-        found_files: List[str] = []
-        for entry in sorted(os.listdir(folder)):
-            ext = os.path.splitext(entry)[1].lower()
-            if ext in (".pdf", ".dxf"):
-                found_files.append(os.path.join(folder, entry))
-        if not found_files:
-            messagebox.showinfo("フォルダ読込", "指定されたフォルダ内に PDF (.pdf) または DXF (.dxf) ファイルが見つかりませんでした。")
+        files = [
+            os.path.join(folder, f)
+            for f in sorted(os.listdir(folder))
+            if os.path.splitext(f)[1].lower() in SUPPORTED_DRAWING_EXTENSIONS
+        ]
+        if not files:
+            messagebox.showinfo("フォルダ読込", "指定フォルダ内に対象の図面ファイル (PDF / DXF / 画像) が見つかりませんでした。")
             return
-        self._load_drawing_files(found_files)
+        self._load_drawing_files(files)
 
     def action_load_sample_drawings(self) -> None:
-        """サンプル2D図面(PDF組立図 & DXFブラケット図)を自動作成して読み込む"""
         self.set_status("サンプル2D図面 (PDF / DXF) を生成しています...")
         try:
-            sample_dir = os.path.join(tempfile.gettempdir(), "PartLens_Sample_Drawings")
-            os.makedirs(sample_dir, exist_ok=True)
-            pdf_path = os.path.join(sample_dir, "Sample_Conveyor_Drive_Unit_CV1001.pdf")
-            dxf_path = os.path.join(sample_dir, "Sample_Clamp_Bracket_BRK200.dxf")
-
-            SampleDrawingGenerator.create_sample_pdf(pdf_path)
-            SampleDrawingGenerator.create_sample_dxf(dxf_path)
-
-            self._load_drawing_files([pdf_path, dxf_path])
-            self.set_status("サンプル図面 (PDF 1件, DXF 1件) を生成・解析し、部品表を自動作成しました！")
+            s_dir = os.path.join(tempfile.gettempdir(), "PartLens_Sample_Drawings")
+            os.makedirs(s_dir, exist_ok=True)
+            p_pdf = SampleDrawingGenerator.create_sample_pdf(os.path.join(s_dir, "Sample_Conveyor_Drive_Unit_CV1001.pdf"))
+            p_dxf = SampleDrawingGenerator.create_sample_dxf(os.path.join(s_dir, "Sample_Clamp_Bracket_BRK200.dxf"))
+            self._load_drawing_files([p_pdf, p_dxf])
         except Exception as e:
-            messagebox.showerror("サンプル生成エラー", f"サンプル図面の作成中にエラーが発生しました:\n{e}")
+            messagebox.showerror("サンプル生成エラー", str(e))
 
     def _load_drawing_files(self, file_paths: List[str]) -> None:
         self._push_undo_state()
-        added_docs = 0
+        new_docs: List[DrawingDocument] = []
         added_parts = 0
         errors: List[str] = []
 
         for path in file_paths:
-            self.set_status(f"図面を解析中: {os.path.basename(path)} ...")
+            self.set_status(f"図面を読み込み中: {os.path.basename(path)} ...")
             try:
                 doc_model, extracted = DrawingParserEngine.parse_file(path)
                 self.documents.append(doc_model)
+                new_docs.append(doc_model)
                 self.parts.extend(extracted)
-                added_docs += 1
                 added_parts += len(extracted)
-
-                # 最初の図面から案件名・図番が取れたらヘッダーに自動セット
                 if doc_model.drawing_title and self.proj_name_var.get() in ("", "新規機械設計プロジェクト"):
                     self.proj_name_var.set(doc_model.drawing_title)
                 if doc_model.drawing_number and self.dwg_no_var.get() in ("", "ASM-0001"):
@@ -3138,70 +3879,47 @@ class PartLensApp:
 
         self._refresh_document_listbox()
         if self.documents and self.current_doc_idx == -1:
-            self.current_doc_idx = len(self.documents) - added_docs
+            self.current_doc_idx = len(self.documents) - len(new_docs)
             self.current_page_idx = 0
             self.doc_listbox.selection_clear(0, tk.END)
             self.doc_listbox.selection_set(self.current_doc_idx)
 
         self.action_renumber_rows(push_undo=False)
         self._fit_canvas_view()
-
         if errors:
-            messagebox.showwarning("一部ファイルの読み込みエラー", "\n".join(errors))
+            messagebox.showwarning("読込エラー", "\n".join(errors))
 
-        self.set_status(f"図面 {added_docs} ファイルを読込完了。合計 {added_parts} 件の部品データを自動抽出しました。")
+        # APIキー設定済み かつ 自動AI解析がONなら引き続いてGemini高精度解析を実行
+        if new_docs and self.gemini_config.api_key.strip() and self.gemini_config.auto_use_on_load:
+            targets = [(d, pg) for d in new_docs for pg in d.pages]
+            self._run_ai_page_analysis_async(targets, crop_rect=None)
+        else:
+            self.set_status(f"図面 {len(new_docs)} 件を読込完了 ({added_parts} 件抽出)。さらに精度を高めるには「AI図面解析 (Gemini)」を押してください。")
 
     def action_clear_documents(self) -> None:
-        if not self.documents:
-            return
-        if messagebox.askyesno("確認", "読み込み済みの図面リストをクリアしますか？\n（右側の部品表データは保持されます）"):
+        if self.documents and messagebox.askyesno("確認", "読み込み済みの図面リストをクリアしますか？"):
             self.documents.clear()
             self.current_doc_idx = -1
             self.current_page_idx = 0
             self.highlight_bbox = None
             self._refresh_document_listbox()
             self._redraw_canvas()
-            self.set_status("図面リストをクリアしました。")
-
-    def action_reparse_current_page(self) -> None:
-        page_data = self._get_current_page()
-        if not page_data or self.current_doc_idx < 0:
-            messagebox.showinfo("再解析", "先に図面ファイルを読み込んでください。")
-            return
-        doc = self.documents[self.current_doc_idx]
-        self._push_undo_state()
-        new_parts = DrawingParserEngine.extract_parts_from_tokens(
-            page_data.tokens,
-            doc.file_name,
-            page_data.page_no,
-            (0.0, 0.0, page_data.width, page_data.height),
-            force_all_rows=False,
-        )
-        if not new_parts:
-            messagebox.showinfo("再解析", "追加で検出された部品行はありませんでした。\n範囲選択モードで直接部品欄を囲んで抽出することも可能です。")
-            return
-        self.parts.extend(new_parts)
-        self.action_renumber_rows(push_undo=False)
-        self.set_status(f"{doc.file_name} (Page {page_data.page_no}) から {len(new_parts)} 件の部品を追加抽出しました。")
 
     # --------------------------------------------------------------------------
-    # 図面プレビュー＆インタラクティブ矩形範囲選択抽出
+    # プレビューキャンバス操作・矩形範囲選択抽出
     # --------------------------------------------------------------------------
     def _refresh_document_listbox(self) -> None:
         self.doc_listbox.delete(0, tk.END)
-        for idx, doc in enumerate(self.documents, start=1):
-            label = f"[{doc.file_type}] {doc.file_name}  ({len(doc.pages)}P / 抽出:{doc.extracted_count}件)"
+        for doc in self.documents:
+            lbl = f"[{doc.file_type}] {doc.file_name} ({len(doc.pages)}P / 抽出:{doc.extracted_count}件)"
             if doc.drawing_title:
-                label += f" - {doc.drawing_title}"
-            self.doc_listbox.insert(tk.END, label)
+                lbl += f" - {doc.drawing_title}"
+            self.doc_listbox.insert(tk.END, lbl)
 
-    def _on_select_document(self, _event: tk.Event) -> None:
+    def _on_select_document(self, _e: tk.Event) -> None:
         sel = self.doc_listbox.curselection()
-        if not sel:
-            return
-        idx = int(sel[0])
-        if 0 <= idx < len(self.documents):
-            self.current_doc_idx = idx
+        if sel and 0 <= int(sel[0]) < len(self.documents):
+            self.current_doc_idx = int(sel[0])
             self.current_page_idx = 0
             self.highlight_bbox = None
             self._fit_canvas_view()
@@ -3216,9 +3934,8 @@ class PartLensApp:
     def _change_page(self, delta: int) -> None:
         if 0 <= self.current_doc_idx < len(self.documents):
             doc = self.documents[self.current_doc_idx]
-            new_idx = self.current_page_idx + delta
-            if 0 <= new_idx < len(doc.pages):
-                self.current_page_idx = new_idx
+            if 0 <= self.current_page_idx + delta < len(doc.pages):
+                self.current_page_idx += delta
                 self.highlight_bbox = None
                 self._fit_canvas_view()
 
@@ -3227,16 +3944,13 @@ class PartLensApp:
         self._redraw_canvas()
 
     def _fit_canvas_view(self) -> None:
-        page_data = self._get_current_page()
-        if not page_data or not page_data.preview_image:
+        pg = self._get_current_page()
+        if not pg or not pg.preview_image:
             self._redraw_canvas()
             return
-        cw = max(self.preview_canvas.winfo_width(), 400)
-        ch = max(self.preview_canvas.winfo_height(), 300)
-        iw, ih = page_data.preview_image.size
-        scale_x = (cw - 24) / max(iw, 1)
-        scale_y = (ch - 24) / max(ih, 1)
-        self.zoom_scale = min(scale_x, scale_y, 2.0)
+        cw, ch = max(self.preview_canvas.winfo_width(), 400), max(self.preview_canvas.winfo_height(), 300)
+        iw, ih = pg.preview_image.size
+        self.zoom_scale = min((cw - 24) / max(iw, 1), (ch - 24) / max(ih, 1), 2.0)
         self.canvas_offset_x = (cw - iw * self.zoom_scale) * 0.5
         self.canvas_offset_y = (ch - ih * self.zoom_scale) * 0.5
         self._redraw_canvas()
@@ -3244,39 +3958,25 @@ class PartLensApp:
     def _toggle_interaction_mode(self) -> None:
         if self.interaction_mode == "pan":
             self.interaction_mode = "select_area"
-            self.btn_mode_select.configure(
-                text="範囲選択して部品抽出: ON (ドラッグで囲む)",
-                bg=LightPalette.BTN_WARN_BG,
-                fg=LightPalette.BTN_WARN_FG,
-            )
+            self.btn_mode_select.configure(text="範囲選択して部品抽出: ON (ドラッグで囲む)", bg=LightPalette.BTN_WARN_BG, fg="#FFFFFF")
             self.preview_canvas.configure(cursor="crosshair")
-            self.set_status("範囲選択抽出モードON: プレビュー図面上の部品欄やテキストをマウス左ドラッグで四角く囲んでください。")
+            self.set_status("範囲選択モードON: 図面上の部品欄や注記をマウス左ドラッグで囲むと、その範囲から部品を抽出します。")
         else:
             self.interaction_mode = "pan"
-            self.btn_mode_select.configure(
-                text="範囲選択して部品抽出: OFF",
-                bg=LightPalette.BTN_DEFAULT_BG,
-                fg=LightPalette.FG_ACCENT,
-            )
+            self.btn_mode_select.configure(text="範囲選択して部品抽出: OFF", bg="#FFFFFF", fg=LightPalette.FG_ACCENT)
             self.preview_canvas.configure(cursor="fleur")
-            self.set_status("移動(パン)モード: プレビュー図面をドラッグして移動できます。")
 
     def _redraw_canvas(self) -> None:
         self.preview_canvas.delete("all")
-        page_data = self._get_current_page()
-
-        if not page_data or not page_data.preview_image:
+        pg = self._get_current_page()
+        if not pg or not pg.preview_image:
             self.page_info_lbl.configure(text="Page: 0 / 0")
             self.zoom_lbl.configure(text="100%")
-            cw = max(self.preview_canvas.winfo_width(), 400)
-            ch = max(self.preview_canvas.winfo_height(), 300)
+            cw, ch = max(self.preview_canvas.winfo_width(), 400), max(self.preview_canvas.winfo_height(), 300)
             self.preview_canvas.create_text(
-                cw // 2,
-                ch // 2,
-                text="ここに2D図面 (PDF / DXF) のプレビューが表示されます\n\n上部の「図面ファイルを開く」または「サンプル図面で試す」をクリックしてください",
-                fill=LightPalette.FG_MUTED,
-                font=("Meiryo UI", 10, "bold"),
-                justify=tk.CENTER,
+                cw // 2, ch // 2,
+                text="ここに2D図面 (PDF / DXF) のプレビューが表示されます\n\n「図面ファイルを開く」または「サンプル図面で試す」をクリックしてください",
+                fill=LightPalette.FG_MUTED, font=("Meiryo UI", 10, "bold"), justify=tk.CENTER,
             )
             return
 
@@ -3284,62 +3984,35 @@ class PartLensApp:
         self.page_info_lbl.configure(text=f"Page: {self.current_page_idx + 1} / {len(doc.pages)}")
         self.zoom_lbl.configure(text=f"{int(self.zoom_scale * 100)}%")
 
-        iw, ih = page_data.preview_image.size
-        disp_w = max(int(iw * self.zoom_scale), 10)
-        disp_h = max(int(ih * self.zoom_scale), 10)
+        iw, ih = pg.preview_image.size
+        dw, dh = max(int(iw * self.zoom_scale), 10), max(int(ih * self.zoom_scale), 10)
+        self._tk_preview_img = ImageTk.PhotoImage(pg.preview_image.resize((dw, dh), Image.Resampling.BILINEAR))
 
-        resized = page_data.preview_image.resize((disp_w, disp_h), Image.Resampling.BILINEAR)
-        self._tk_preview_img = ImageTk.PhotoImage(resized)
-
-        ox = int(self.canvas_offset_x)
-        oy = int(self.canvas_offset_y)
+        ox, oy = int(self.canvas_offset_x), int(self.canvas_offset_y)
         self.preview_canvas.create_image(ox, oy, anchor=tk.NW, image=self._tk_preview_img)
-        self.preview_canvas.create_rectangle(ox, oy, ox + disp_w, oy + disp_h, outline="#94A3B8", width=1)
+        self.preview_canvas.create_rectangle(ox, oy, ox + dw, oy + dh, outline="#94A3B8", width=1)
 
-        # 選択部品行の座標ハイライト枠を描画
-        if self.highlight_bbox and any(self.highlight_bbox):
+        if self.highlight_bbox and any(self.highlight_bbox) and pg.width > 0 and pg.height > 0:
             bx0, by0, bx1, by1 = self.highlight_bbox
-            if page_data.width > 0 and page_data.height > 0:
-                sx0 = ox + (bx0 / page_data.width) * disp_w
-                sy0 = oy + (by0 / page_data.height) * disp_h
-                sx1 = ox + (bx1 / page_data.width) * disp_w
-                sy1 = oy + (by1 / page_data.height) * disp_h
-                self.preview_canvas.create_rectangle(
-                    sx0 - 4, sy0 - 4, sx1 + 4, sy1 + 4,
-                    outline=LightPalette.HIGHLIGHT_BOX,
-                    width=3,
-                )
+            sx0, sy0 = ox + (bx0 / pg.width) * dw, oy + (by0 / pg.height) * dh
+            sx1, sy1 = ox + (bx1 / pg.width) * dw, oy + (by1 / pg.height) * dh
+            self.preview_canvas.create_rectangle(sx0 - 4, sy0 - 4, sx1 + 4, sy1 + 4, outline=LightPalette.HIGHLIGHT_BOX, width=3)
 
     def _on_canvas_mouse_down(self, event: tk.Event) -> None:
-        self.drag_start_x = event.x
-        self.drag_start_y = event.y
+        self.drag_start_x, self.drag_start_y = event.x, event.y
         if self.interaction_mode == "select_area":
             if self.selection_rect_id:
                 self.preview_canvas.delete(self.selection_rect_id)
-            self.selection_rect_id = self.preview_canvas.create_rectangle(
-                event.x, event.y, event.x, event.y,
-                outline=LightPalette.SELECT_BOX,
-                width=2,
-                dash=(5, 3),
-            )
+            self.selection_rect_id = self.preview_canvas.create_rectangle(event.x, event.y, event.x, event.y, outline=LightPalette.SELECT_BOX, width=2, dash=(5, 3))
 
     def _on_canvas_mouse_move(self, event: tk.Event) -> None:
         if self.interaction_mode == "pan":
-            dx = event.x - self.drag_start_x
-            dy = event.y - self.drag_start_y
-            self.canvas_offset_x += dx
-            self.canvas_offset_y += dy
-            self.drag_start_x = event.x
-            self.drag_start_y = event.y
+            self.canvas_offset_x += event.x - self.drag_start_x
+            self.canvas_offset_y += event.y - self.drag_start_y
+            self.drag_start_x, self.drag_start_y = event.x, event.y
             self._redraw_canvas()
         elif self.interaction_mode == "select_area" and self.selection_rect_id:
-            self.preview_canvas.coords(
-                self.selection_rect_id,
-                self.drag_start_x,
-                self.drag_start_y,
-                event.x,
-                event.y,
-            )
+            self.preview_canvas.coords(self.selection_rect_id, self.drag_start_x, self.drag_start_y, event.x, event.y)
 
     def _on_canvas_mouse_up(self, event: tk.Event) -> None:
         if self.interaction_mode != "select_area":
@@ -3348,49 +4021,32 @@ class PartLensApp:
             self.preview_canvas.delete(self.selection_rect_id)
             self.selection_rect_id = None
 
-        page_data = self._get_current_page()
-        if not page_data or not page_data.preview_image:
+        pg = self._get_current_page()
+        if not pg or not pg.preview_image:
+            return
+        x0_s, y0_s = min(self.drag_start_x, event.x), min(self.drag_start_y, event.y)
+        x1_s, y1_s = max(self.drag_start_x, event.x), max(self.drag_start_y, event.y)
+        if (x1_s - x0_s) < 12 or (y1_s - y0_s) < 10:
             return
 
-        x0_scr = min(self.drag_start_x, event.x)
-        y0_scr = min(self.drag_start_y, event.y)
-        x1_scr = max(self.drag_start_x, event.x)
-        y1_scr = max(self.drag_start_y, event.y)
-
-        if (x1_scr - x0_scr) < 12 or (y1_scr - y0_scr) < 10:
-            return
-
-        iw, ih = page_data.preview_image.size
-        disp_w = max(iw * self.zoom_scale, 1.0)
-        disp_h = max(ih * self.zoom_scale, 1.0)
-
-        # スクリーン座標 -> ページ実座標へ逆変換
-        rel_x0 = (x0_scr - self.canvas_offset_x) / disp_w
-        rel_y0 = (y0_scr - self.canvas_offset_y) / disp_h
-        rel_x1 = (x1_scr - self.canvas_offset_x) / disp_w
-        rel_y1 = (y1_scr - self.canvas_offset_y) / disp_h
-
-        px0 = max(0.0, rel_x0 * page_data.width)
-        py0 = max(0.0, rel_y0 * page_data.height)
-        px1 = min(page_data.width, rel_x1 * page_data.width)
-        py1 = min(page_data.height, rel_y1 * page_data.height)
+        iw, ih = pg.preview_image.size
+        dw, dh = max(iw * self.zoom_scale, 1.0), max(ih * self.zoom_scale, 1.0)
+        px0 = max(0.0, ((x0_s - self.canvas_offset_x) / dw) * pg.width)
+        py0 = max(0.0, ((y0_s - self.canvas_offset_y) / dh) * pg.height)
+        px1 = min(pg.width, ((x1_s - self.canvas_offset_x) / dw) * pg.width)
+        py1 = min(pg.height, ((y1_s - self.canvas_offset_y) / dh) * pg.height)
 
         doc = self.documents[self.current_doc_idx]
-        extracted = DrawingParserEngine.extract_parts_from_tokens(
-            page_data.tokens,
-            doc.file_name,
-            page_data.page_no,
-            (px0, py0, px1, py1),
-            force_all_rows=True,
-        )
 
-        if not extracted:
-            messagebox.showinfo(
-                "範囲選択抽出",
-                "選択された範囲内にテキストデータが検出されませんでした。\n文字を含む箇所を広めに囲んで再度お試しください。",
-            )
+        # Gemini APIキーが設定されており範囲AI抽出が有効なら、選択範囲のクロップ画像＋テキストでGemini解析を実行
+        if self.gemini_config.api_key.strip() and self.gemini_config.use_for_area_select:
+            self._run_ai_page_analysis_async([(doc, pg)], crop_rect=(px0, py0, px1, py1))
             return
 
+        extracted = DrawingParserEngine.extract_parts_from_tokens(pg.tokens, doc.file_name, pg.page_no, (px0, py0, px1, py1), force_all_rows=True)
+        if not extracted:
+            messagebox.showinfo("範囲選択抽出", "選択範囲内にテキストが見つかりませんでした。\nスキャン図面の場合は「Gemini AI設定」でAPIキーを設定すると画像認識で読み取れます。")
+            return
         self._push_undo_state()
         self.parts.extend(extracted)
         doc.extracted_count += len(extracted)
@@ -3398,64 +4054,53 @@ class PartLensApp:
         self.action_renumber_rows(push_undo=False)
         self.highlight_bbox = (px0, py0, px1, py1)
         self._redraw_canvas()
-        self.set_status(f"選択範囲から {len(extracted)} 件の部品データを抽出し、部品表へ追加しました！")
-
-    def _on_canvas_mouse_wheel(self, event: tk.Event) -> None:
-        factor = 1.15 if event.delta > 0 else 0.85
-        self._zoom_by(factor)
+        self.set_status(f"選択範囲から {len(extracted)} 件の部品データを抽出し追加しました。")
 
     # --------------------------------------------------------------------------
-    # 部品表 (Treeview) の表示・インライン編集・操作アクション
+    # Treeview 表示・編集・行操作
     # --------------------------------------------------------------------------
+    def _recalculate_doc_counts(self) -> None:
+        if not self.documents:
+            return
+        changed = False
+        for doc in self.documents:
+            cnt = sum(1 for p in self.parts if p.source_file == doc.file_name)
+            if doc.extracted_count != cnt:
+                doc.extracted_count = cnt
+                changed = True
+        if changed:
+            self._refresh_document_listbox()
+            if 0 <= self.current_doc_idx < len(self.documents):
+                self.doc_listbox.selection_clear(0, tk.END)
+                self.doc_listbox.selection_set(self.current_doc_idx)
+
     def _refresh_treeview(self) -> None:
         self._close_inline_editor()
-        for item_id in self.tree.get_children():
-            self.tree.delete(item_id)
+        self._recalculate_doc_counts()
+        for iid in self.tree.get_children():
+            self.tree.delete(iid)
 
-        keyword = self.filter_var.get().strip().lower()
-        visible_idx = 0
-
+        kw = self.filter_var.get().strip().lower()
+        vis_i = 0
         for p in self.parts:
-            if keyword:
-                haystack = f"{p.part_number} {p.part_name} {p.specification} {p.material} {p.treatment} {p.manufacturer} {p.remarks}".lower()
-                if keyword not in haystack:
-                    continue
-
-            tag = "even" if visible_idx % 2 == 0 else "odd"
-            visible_idx += 1
-
-            values = (
-                p.item_no,
-                p.part_number,
-                p.part_name,
-                p.specification,
-                p.material,
-                p.treatment,
-                p.formatted_qty(),
-                p.unit,
-                f"{p.unit_weight:.3f}" if p.unit_weight > 0 else "0.000",
-                f"{p.total_weight:.3f}" if p.total_weight > 0 else "0.000",
-                p.category,
-                p.manufacturer,
-                f"{int(p.unit_price):,}" if p.unit_price > 0 else "0",
-                f"{int(p.amount):,}" if p.amount > 0 else "0",
-                p.source_file,
-                p.remarks,
+            if kw and kw not in f"{p.part_number} {p.part_name} {p.specification} {p.material} {p.treatment} {p.manufacturer} {p.remarks}".lower():
+                continue
+            tag = "even" if vis_i % 2 == 0 else "odd"
+            vis_i += 1
+            vals = (
+                p.item_no, p.part_number, p.part_name, p.specification, p.material, p.treatment,
+                p.formatted_qty(), p.unit, f"{p.unit_weight:.3f}", f"{p.total_weight:.3f}",
+                p.category, p.manufacturer, f"{int(p.unit_price):,}", f"{int(p.amount):,}", p.source_file, p.remarks,
             )
-            self.tree.insert("", tk.END, iid=p.uid, values=values, tags=(tag,))
-
+            self.tree.insert("", tk.END, iid=p.uid, values=vals, tags=(tag,))
         self._update_summary_bar()
 
     def _update_summary_bar(self) -> None:
-        total_rows = len(self.parts)
-        total_qty = sum(p.quantity for p in self.parts)
-        total_wt = sum(p.total_weight for p in self.parts)
-        total_amt = sum(p.amount for p in self.parts)
-
-        qty_str = str(int(total_qty)) if float(total_qty).is_integer() else f"{total_qty:.2f}"
-        self.summary_lbl.configure(
-            text=f"総部品行数: {total_rows} 件   |   総個数: {qty_str}   |   総重量: {total_wt:.3f} kg   |   合計金額: ¥{int(total_amt):,}"
-        )
+        tq = sum(p.quantity for p in self.parts)
+        tw = sum(p.total_weight for p in self.parts)
+        ta = sum(p.amount for p in self.parts)
+        qs = str(int(tq)) if float(tq).is_integer() else f"{tq:.2f}"
+        self.summary_lbl.configure(text=f"総部品行数: {len(self.parts)} 件   |   総個数: {qs}   |   総重量: {tw:.3f} kg   |   合計金額: ¥{int(ta):,}")
 
     def _find_part_by_uid(self, uid: str) -> Optional[PartItem]:
         for p in self.parts:
@@ -3463,86 +4108,50 @@ class PartLensApp:
                 return p
         return None
 
-    def _on_tree_select(self, _event: tk.Event) -> None:
+    def _on_tree_select(self, _e: tk.Event) -> None:
         sel = self.tree.selection()
         if not sel:
             return
-        uid = sel[0]
-        part = self._find_part_by_uid(uid)
+        part = self._find_part_by_uid(sel[0])
         if not part:
             return
-
-        self.selected_part_uid = uid
-        self.form_vars["item_no"].set(part.item_no)
-        self.form_vars["part_number"].set(part.part_number)
-        self.form_vars["part_name"].set(part.part_name)
-        self.form_vars["specification"].set(part.specification)
-        self.form_vars["material"].set(part.material)
-        self.form_vars["treatment"].set(part.treatment)
+        self.selected_part_uid = part.uid
+        for k in ["item_no", "part_number", "part_name", "specification", "material", "treatment", "unit", "category", "manufacturer", "remarks"]:
+            self.form_vars[k].set(str(getattr(part, k, "")))
         self.form_vars["quantity"].set(part.formatted_qty())
-        self.form_vars["unit"].set(part.unit)
         self.form_vars["unit_weight"].set(f"{part.unit_weight:.3f}")
-        self.form_vars["category"].set(part.category)
-        self.form_vars["manufacturer"].set(part.manufacturer)
         self.form_vars["unit_price"].set(str(int(part.unit_price)) if float(part.unit_price).is_integer() else str(part.unit_price))
-        self.form_vars["remarks"].set(part.remarks)
 
-        # 抽出元図面があればプレビューを切り替えて座標ハイライト表示
         if part.source_file:
-            for d_idx, doc in enumerate(self.documents):
+            for d_i, doc in enumerate(self.documents):
                 if doc.file_name == part.source_file:
-                    if self.current_doc_idx != d_idx or self.current_page_idx != max(part.source_page - 1, 0):
-                        self.current_doc_idx = d_idx
-                        self.current_page_idx = max(min(part.source_page - 1, len(doc.pages) - 1), 0)
+                    self.current_doc_idx = d_i
+                    self.current_page_idx = max(min(part.source_page - 1, len(doc.pages) - 1), 0)
                     break
         self.highlight_bbox = part.bbox
         self._redraw_canvas()
 
     def action_apply_detail_form(self) -> None:
         if not self.selected_part_uid:
-            messagebox.showinfo("行未選択", "編集する部品行を一覧から選択してください。")
             return
         part = self._find_part_by_uid(self.selected_part_uid)
         if not part:
             return
-
         self._push_undo_state()
-        part.item_no = self.form_vars["item_no"].get().strip() or part.item_no
-        part.part_number = self.form_vars["part_number"].get().strip()
-        part.part_name = self.form_vars["part_name"].get().strip()
-        part.specification = self.form_vars["specification"].get().strip()
-        part.material = self.form_vars["material"].get().strip()
-        part.treatment = self.form_vars["treatment"].get().strip()
-        part.unit = self.form_vars["unit"].get().strip() or "個"
-        part.category = self.form_vars["category"].get().strip() or "加工品"
-        part.manufacturer = self.form_vars["manufacturer"].get().strip()
-        part.remarks = self.form_vars["remarks"].get().strip()
-
-        try:
-            part.quantity = max(float(self.form_vars["quantity"].get().replace(",", "")), 0.0)
-        except ValueError:
-            pass
-        try:
-            part.unit_weight = max(float(self.form_vars["unit_weight"].get().replace(",", "")), 0.0)
-        except ValueError:
-            pass
-        try:
-            part.unit_price = max(float(self.form_vars["unit_price"].get().replace(",", "")), 0.0)
-        except ValueError:
-            pass
-
-        # 単重が0で寸法がある場合は自動推算
+        for k in ["item_no", "part_number", "part_name", "specification", "material", "treatment", "unit", "category", "manufacturer", "remarks"]:
+            setattr(part, k, self.form_vars[k].get().strip())
+        for nk in ["quantity", "unit_weight", "unit_price"]:
+            try:
+                setattr(part, nk, max(float(self.form_vars[nk].get().replace(",", "")), 0.0))
+            except ValueError:
+                pass
         if part.unit_weight == 0.0 and part.specification:
             part.unit_weight = SmartPartAnalyzer.estimate_weight_from_spec(part.specification, part.material)
-
         self._refresh_treeview()
         if self.tree.exists(part.uid):
             self.tree.selection_set(part.uid)
-        self.set_status(f"No.{part.item_no} 「{part.part_name}」の部品情報を更新しました。")
+        self.set_status(f"No.{part.item_no} 「{part.part_name}」を更新しました。")
 
-    # --------------------------------------------------------------------------
-    # Treeview ダブルクリック・セル直接インライン編集
-    # --------------------------------------------------------------------------
     def _close_inline_editor(self) -> None:
         if self._inline_editor is not None:
             try:
@@ -3553,359 +4162,252 @@ class PartLensApp:
 
     def _on_tree_double_click(self, event: tk.Event) -> None:
         self._close_inline_editor()
-        region = self.tree.identify("region", event.x, event.y)
-        if region != "cell":
+        if self.tree.identify("region", event.x, event.y) != "cell":
             return
-
         row_id = self.tree.identify_row(event.y)
         col_id = self.tree.identify_column(event.x)
         if not row_id or not col_id:
             return
-
         col_idx = int(col_id.replace("#", "")) - 1
-        if col_idx < 0 or col_idx >= len(self.TREE_COLUMNS):
+        if not (0 <= col_idx < len(self.TREE_COLUMNS)):
             return
-        field_name = self.TREE_COLUMNS[col_idx]
-
-        # 自動計算列(total_weight, amount)がダブルクリックされた場合は単重または単価列を編集対象にする
-        if field_name == "total_weight":
-            field_name = "unit_weight"
-            col_idx = self.TREE_COLUMNS.index("unit_weight")
-            col_id = f"#{col_idx + 1}"
-        elif field_name == "amount":
-            field_name = "unit_price"
-            col_idx = self.TREE_COLUMNS.index("unit_price")
-            col_id = f"#{col_idx + 1}"
+        fn = self.TREE_COLUMNS[col_idx]
+        if fn == "total_weight":
+            fn, col_id = "unit_weight", f"#{self.TREE_COLUMNS.index('unit_weight') + 1}"
+        elif fn == "amount":
+            fn, col_id = "unit_price", f"#{self.TREE_COLUMNS.index('unit_price') + 1}"
 
         bbox = self.tree.bbox(row_id, col_id)
-        if not bbox:
+        part = self._find_part_by_uid(row_id)
+        if not bbox or not part:
             return
         bx, by, bw, bh = bbox
+        var = tk.StringVar(value=part.formatted_qty() if fn == "quantity" else str(getattr(part, fn, "")))
 
-        part = self._find_part_by_uid(row_id)
-        if not part:
-            return
-
-        cur_val = str(getattr(part, field_name, ""))
-        if field_name == "quantity":
-            cur_val = part.formatted_qty()
-
-        var = tk.StringVar(value=cur_val)
-
-        if field_name == "material":
-            editor: tk.Widget = ttk.Combobox(self.tree, textvariable=var, values=list(MATERIAL_MASTER.keys()))
-        elif field_name == "treatment":
-            editor = ttk.Combobox(self.tree, textvariable=var, values=SURFACE_TREATMENTS)
-        elif field_name == "category":
-            editor = ttk.Combobox(self.tree, textvariable=var, values=CATEGORIES)
-        elif field_name == "unit":
-            editor = ttk.Combobox(self.tree, textvariable=var, values=UNITS)
+        if fn == "material":
+            ed: tk.Widget = ttk.Combobox(self.tree, textvariable=var, values=list(MATERIAL_MASTER.keys()))
+        elif fn == "treatment":
+            ed = ttk.Combobox(self.tree, textvariable=var, values=SURFACE_TREATMENTS)
+        elif fn == "category":
+            ed = ttk.Combobox(self.tree, textvariable=var, values=CATEGORIES)
+        elif fn == "unit":
+            ed = ttk.Combobox(self.tree, textvariable=var, values=UNITS)
         else:
-            editor = tk.Entry(
-                self.tree,
-                textvariable=var,
-                bg="#FEF9C3",
-                fg=LightPalette.FG_MAIN,
-                relief=tk.SOLID,
-                bd=1,
-                font=("Meiryo UI", 9),
-            )
+            ed = tk.Entry(self.tree, textvariable=var, bg="#FEF9C3", fg=LightPalette.FG_MAIN, relief=tk.SOLID, bd=1, font=("Meiryo UI", 9))
 
-        editor.place(x=bx, y=by, width=max(bw, 70), height=bh)
-        editor.focus_set()
-        if isinstance(editor, tk.Entry):
-            editor.select_range(0, tk.END)
+        ed.place(x=bx, y=by, width=max(bw, 70), height=bh)
+        ed.focus_set()
+        if isinstance(ed, tk.Entry):
+            ed.select_range(0, tk.END)
+        self._inline_editor = ed
 
-        self._inline_editor = editor
-
-        def commit_edit(_e: Optional[tk.Event] = None) -> None:
+        def commit(_e: Optional[tk.Event] = None) -> None:
             if self._inline_editor is None:
                 return
-            new_val = var.get().strip()
+            nv = var.get().strip()
             self._close_inline_editor()
             self._push_undo_state()
-            if field_name in ("quantity", "unit_weight", "unit_price"):
+            if fn in ("quantity", "unit_weight", "unit_price"):
                 try:
-                    num = max(float(new_val.replace(",", "")), 0.0)
-                    setattr(part, field_name, num)
+                    setattr(part, fn, max(float(nv.replace(",", "")), 0.0))
                 except ValueError:
                     pass
             else:
-                setattr(part, field_name, new_val)
-
-            if field_name in ("specification", "material") and part.unit_weight == 0.0 and part.specification:
+                setattr(part, fn, nv)
+            if fn in ("specification", "material") and part.unit_weight == 0.0 and part.specification:
                 part.unit_weight = SmartPartAnalyzer.estimate_weight_from_spec(part.specification, part.material)
-
             self._refresh_treeview()
             if self.tree.exists(part.uid):
                 self.tree.selection_set(part.uid)
                 self._on_tree_select(event)
 
-        editor.bind("<Return>", commit_edit)
-        editor.bind("<FocusOut>", commit_edit)
-        editor.bind("<Escape>", lambda _e: self._close_inline_editor())
+        ed.bind("<Return>", commit)
+        if isinstance(ed, ttk.Combobox):
+            ed.bind("<<ComboboxSelected>>", commit)
+        else:
+            ed.bind("<FocusOut>", commit)
+        ed.bind("<Escape>", lambda _e: self._close_inline_editor())
 
     def _sort_tree_by_column(self, col_name: str) -> None:
         if not self.parts:
             return
         self._push_undo_state()
+        desc = self._sort_col_desc.get(col_name, False)
+        self._sort_col_desc[col_name] = not desc
 
         def sort_key(p: PartItem) -> Any:
             if col_name == "item_no":
-                return int(p.item_no) if p.item_no.isdigit() else 999999
+                return int(p.item_no) if str(p.item_no).isdigit() else 999999
             if col_name in ("quantity", "unit_weight", "total_weight", "unit_price", "amount"):
-                return float(getattr(p, col_name, 0.0))
-            return str(getattr(p, col_name, "")).lower()
+                return float(getattr(p, col_name, 0.0) or 0.0)
+            return str(getattr(p, col_name, "") or "").lower()
 
-        self.parts.sort(key=sort_key)
+        self.parts.sort(key=sort_key, reverse=desc)
         self._refresh_treeview()
-        self.set_status(f"列「{col_name}」で並び替えました。")
+        order_str = "降順 (▼)" if desc else "昇順 (▲)"
+        self.set_status(f"列「{col_name}」で {order_str} に並び替えました。")
 
-    # --------------------------------------------------------------------------
-    # 行追加・削除・移動・名寄せ・重量一括計算アクション
-    # --------------------------------------------------------------------------
     def action_add_row(self) -> None:
         self._push_undo_state()
-        next_no = str(len(self.parts) + 1)
-        src_name = ""
-        if 0 <= self.current_doc_idx < len(self.documents):
-            src_name = self.documents[self.current_doc_idx].file_name
-
-        new_item = PartItem(
-            item_no=next_no,
-            part_number=f"P-{len(self.parts) + 1:03d}",
-            part_name="新規部品",
-            specification="",
-            material="SS400",
-            treatment="四三酸化鉄皮膜(黒染め)",
-            quantity=1.0,
-            unit="個",
-            category="加工品",
-            source_file=src_name,
-        )
-        self.parts.append(new_item)
+        src = self.documents[self.current_doc_idx].file_name if 0 <= self.current_doc_idx < len(self.documents) else ""
+        ni = PartItem(item_no=str(len(self.parts) + 1), part_number=f"P-{len(self.parts) + 1:03d}", part_name="新規部品", material="SS400", treatment="四三酸化鉄皮膜(黒染め)", source_file=src)
+        self.parts.append(ni)
         self._refresh_treeview()
-        if self.tree.exists(new_item.uid):
-            self.tree.selection_set(new_item.uid)
-            self.tree.see(new_item.uid)
-            self.selected_part_uid = new_item.uid
-        self.set_status("新しい部品行を追加しました。")
+        self.tree.selection_set(ni.uid)
+        self.tree.see(ni.uid)
+        self.selected_part_uid = ni.uid
 
     def action_duplicate_row(self) -> None:
         sel = self.tree.selection()
         if not sel:
-            messagebox.showinfo("複製", "複製する行を選択してください。")
             return
         part = self._find_part_by_uid(sel[0])
-        if not part:
-            return
-        self._push_undo_state()
-        dup = copy.deepcopy(part)
-        dup.uid = str(uuid.uuid4())
-        idx = self.parts.index(part)
-        self.parts.insert(idx + 1, dup)
-        self.action_renumber_rows(push_undo=False)
-        if self.tree.exists(dup.uid):
-            self.tree.selection_set(dup.uid)
-        self.set_status(f"「{part.part_name}」の行を複製しました。")
+        if part:
+            self._push_undo_state()
+            dup = copy.deepcopy(part)
+            dup.uid = str(uuid.uuid4())
+            self.parts.insert(self.parts.index(part) + 1, dup)
+            self.action_renumber_rows(push_undo=False)
 
     def action_delete_rows(self) -> None:
         sel = self.tree.selection()
-        if not sel:
-            return
-        self._push_undo_state()
-        del_uids = set(sel)
-        self.parts = [p for p in self.parts if p.uid not in del_uids]
-        self.selected_part_uid = None
-        self._refresh_treeview()
-        self.set_status(f"{len(del_uids)} 件の部品行を削除しました。")
+        if sel:
+            self._push_undo_state()
+            del_set = set(sel)
+            self.parts = [p for p in self.parts if p.uid not in del_set]
+            self.selected_part_uid = None
+            self._refresh_treeview()
 
     def action_move_row(self, direction: int) -> None:
         sel = self.tree.selection()
         if not sel:
             return
-        uid = sel[0]
-        part = self._find_part_by_uid(uid)
-        if not part:
-            return
-        idx = self.parts.index(part)
-        new_idx = idx + direction
-        if 0 <= new_idx < len(self.parts):
-            self._push_undo_state()
-            self.parts[idx], self.parts[new_idx] = self.parts[new_idx], self.parts[idx]
-            self._refresh_treeview()
-            self.tree.selection_set(uid)
-            self.tree.see(uid)
+        part = self._find_part_by_uid(sel[0])
+        if part:
+            idx = self.parts.index(part)
+            n_idx = idx + direction
+            if 0 <= n_idx < len(self.parts):
+                self._push_undo_state()
+                self.parts[idx], self.parts[n_idx] = self.parts[n_idx], self.parts[idx]
+                self._refresh_treeview()
+                self.tree.selection_set(part.uid)
 
     def action_renumber_rows(self, push_undo: bool = True) -> None:
-        if not self.parts:
-            self._refresh_treeview()
-            return
-        if push_undo:
+        if push_undo and self.parts:
             self._push_undo_state()
-        for idx, p in enumerate(self.parts, start=1):
-            p.item_no = str(idx)
+        for i, p in enumerate(self.parts, start=1):
+            p.item_no = str(i)
         self._refresh_treeview()
-        if push_undo:
-            self.set_status("全行の項番(No.)を1から連番に振り直しました。")
 
     def action_merge_duplicates(self) -> None:
-        if len(self.parts) < 2:
-            return
-        before_count = len(self.parts)
-        self._push_undo_state()
-        self.parts = ExcelBOMExporter.merge_duplicate_parts(self.parts)
-        after_count = len(self.parts)
-        self._refresh_treeview()
-        self.set_status(f"重複部品の名寄せ統合を実行しました ({before_count} 行 → {after_count} 行)。")
+        if len(self.parts) >= 2:
+            self._push_undo_state()
+            self.parts = ExcelBOMExporter.merge_duplicate_parts(self.parts)
+            self._refresh_treeview()
+            self.set_status("重複部品の名寄せ統合を実行しました。")
 
     def action_auto_calc_weights(self) -> None:
         if not self.parts:
             return
         self._push_undo_state()
-        updated = 0
+        cnt = 0
         for p in self.parts:
-            if p.specification:
-                w = SmartPartAnalyzer.estimate_weight_from_spec(p.specification, p.material)
-                if w > 0:
-                    p.unit_weight = w
-                    updated += 1
+            w = SmartPartAnalyzer.estimate_weight_from_spec(p.specification, p.material)
+            if w > 0:
+                p.unit_weight = w
+                cnt += 1
         self._refresh_treeview()
-        self.set_status(f"型式・寸法と材質から {updated} 件の部品の単重(kg)を自動計算しました。")
+        self.set_status(f"寸法と材質から {cnt} 件の単重(kg)を自動計算しました。")
 
     def action_open_weight_calculator(self) -> None:
-        init_mat = "SS400"
+        init_m = "SS400"
         if self.selected_part_uid:
-            part = self._find_part_by_uid(self.selected_part_uid)
-            if part and part.material:
-                init_mat = part.material
+            p = self._find_part_by_uid(self.selected_part_uid)
+            if p and p.material:
+                init_m = p.material
 
-        def on_apply(weight_kg: float, spec_str: str, mat_str: str) -> None:
+        def on_apply(w_kg: float, spec_s: str, mat_s: str) -> None:
             if self.selected_part_uid:
-                part = self._find_part_by_uid(self.selected_part_uid)
-                if part:
+                p = self._find_part_by_uid(self.selected_part_uid)
+                if p:
                     self._push_undo_state()
-                    part.unit_weight = weight_kg
-                    if not part.specification:
-                        part.specification = spec_str
-                    if not part.material:
-                        part.material = mat_str
+                    p.unit_weight = w_kg
+                    if not p.specification:
+                        p.specification = spec_s
+                    if not p.material:
+                        p.material = mat_s
                     self._refresh_treeview()
-                    self.tree.selection_set(part.uid)
-                    self.set_status(f"計算結果 ({weight_kg:.3f} kg) を選択中の部品行へ反映しました。")
-            else:
-                self.form_vars["unit_weight"].set(f"{weight_kg:.3f}")
-                self.form_vars["specification"].set(spec_str)
-                self.form_vars["material"].set(mat_str)
-
-        WeightCalculatorDialog(self.root, init_mat, on_apply)
+        WeightCalculatorDialog(self.root, init_m, on_apply)
 
     def action_clear_all_parts(self) -> None:
-        if not self.parts:
-            return
-        if messagebox.askyesno("全クリア確認", "現在の部品表データをすべてクリアしますか？\n（元に戻すボタンで復元可能です）"):
+        if self.parts and messagebox.askyesno("全クリア", "部品表データをすべてクリアしますか？"):
             self._push_undo_state()
             self.parts.clear()
             self.selected_part_uid = None
             self._refresh_treeview()
-            self.set_status("部品表をクリアしました。")
 
     # --------------------------------------------------------------------------
-    # Excel (.xlsx) / CSV 出力・プロジェクト保存/読込アクション
+    # Excel / CSV 出力・プロジェクト保存/読込
     # --------------------------------------------------------------------------
     def action_open_excel_settings(self) -> None:
-        self.excel_config.project_name = self.proj_name_var.get().strip()
-        self.excel_config.drawing_no = self.dwg_no_var.get().strip()
-        self.excel_config.author_name = self.author_var.get().strip()
-        ExcelSettingsDialog(
-            self.root,
-            self.excel_config,
-            lambda: self.set_status("Excel出力設定を更新しました。"),
-        )
+        ExcelSettingsDialog(self.root, self.excel_config, lambda: self.set_status("Excel出力設定を更新しました。"))
 
     def action_export_excel(self) -> None:
         if not self.parts:
-            messagebox.showwarning("部品データなし", "出力する部品データがありません。\n先に図面を読み込むか行を追加してください。")
+            messagebox.showwarning("データなし", "出力する部品データがありません。")
             return
-
         self.excel_config.project_name = self.proj_name_var.get().strip() or "機械設計部品表"
         self.excel_config.drawing_no = self.dwg_no_var.get().strip()
         self.excel_config.author_name = self.author_var.get().strip()
 
-        default_name = f"部品表_{self.excel_config.drawing_no or 'BOM'}_{datetime.date.today().strftime('%Y%m%d')}.xlsx"
-        default_name = re.sub(r"[\\/*?:\"<>|]", "_", default_name)
-
-        out_path = filedialog.asksaveasfilename(
-            title="Excel部品表 (.xlsx) の保存先を指定",
-            defaultextension=".xlsx",
-            initialfile=default_name,
-            filetypes=[("Excel ブック (*.xlsx)", "*.xlsx")],
-        )
+        def_name = re.sub(r"[\\/*?:\"<>|]", "_", f"部品表_{self.excel_config.drawing_no or 'BOM'}_{datetime.date.today().strftime('%Y%m%d')}.xlsx")
+        out_path = filedialog.asksaveasfilename(title="Excel部品表 (.xlsx) の保存", defaultextension=".xlsx", initialfile=def_name, filetypes=[("Excel ブック (*.xlsx)", "*.xlsx")])
         if not out_path:
             return
-
-        self.set_status(f"Excel部品表を作成中: {os.path.basename(out_path)} ...")
         try:
             ExcelBOMExporter.export_to_excel(out_path, self.parts, self.documents, self.excel_config)
-            self.set_status(f"Excel部品表を保存しました: {out_path}")
-            if messagebox.askyesno("Excel出力完了", f"Excel部品表の出力が完了しました！\n\n保存先:\n{out_path}\n\n今すぐこのExcelファイルを開きますか？"):
+            self.set_status(f"Excel部品表を出力しました: {out_path}")
+            if messagebox.askyesno("出力完了", f"Excel部品表の出力が完了しました！\n\n{out_path}\n\n今すぐファイルを開きますか？"):
                 try:
                     os.startfile(out_path)
                 except Exception:
                     pass
         except PermissionError:
-            messagebox.showerror("保存エラー", "出力先のExcelファイルが別のプログラムで開かれています。\nExcelを閉じてから再度出力してください。")
+            messagebox.showerror(
+                "ファイル使用中エラー",
+                f"保存先のExcelファイルが他のソフト（Excelなど）で開かれています。\n\n{out_path}\n\nファイルを閉じてから、もう一度出力してください。",
+            )
         except Exception as e:
-            messagebox.showerror("Excel出力エラー", f"Excelファイルの出力中にエラーが発生しました:\n{e}\n{traceback.format_exc()}")
+            messagebox.showerror("Excel出力エラー", f"保存中にエラーが発生しました:\n{e}")
 
     def action_export_csv(self) -> None:
         if not self.parts:
-            messagebox.showwarning("部品データなし", "出力する部品データがありません。")
+            messagebox.showwarning("データなし", "出力する部品データがありません。")
             return
-
-        default_name = f"部品表_{self.dwg_no_var.get().strip() or 'BOM'}.csv"
-        out_path = filedialog.asksaveasfilename(
-            title="CSV部品表 (.csv) の保存先を指定",
-            defaultextension=".csv",
-            initialfile=default_name,
-            filetypes=[("CSVファイル (Excel対応 UTF-8 BOM付) (*.csv)", "*.csv")],
-        )
+        out_path = filedialog.asksaveasfilename(title="CSV保存", defaultextension=".csv", initialfile="部品表_BOM.csv", filetypes=[("CSV (*.csv)", "*.csv")])
         if not out_path:
             return
-
         try:
             with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    "No.", "図番/品番", "品名", "型式・寸法・仕様", "材質", "表面処理",
-                    "数量", "単位", "単重(kg)", "総重量(kg)", "調達区分", "メーカー",
-                    "単価(円)", "金額(円)", "抽出元図面", "備考"
-                ])
+                w = csv.writer(f)
+                w.writerow(["No.", "図番/品番", "品名", "型式・寸法", "材質", "表面処理", "数量", "単位", "単重(kg)", "総重量(kg)", "調達区分", "メーカー", "単価", "金額", "抽出元図面", "備考"])
                 for p in self.parts:
-                    writer.writerow([
-                        p.item_no, p.part_number, p.part_name, p.specification,
-                        p.material, p.treatment, p.formatted_qty(), p.unit,
-                        p.unit_weight, p.total_weight, p.category, p.manufacturer,
-                        p.unit_price, p.amount, p.source_file, p.remarks
-                    ])
-            self.set_status(f"CSVファイルを保存しました: {out_path}")
-            messagebox.showinfo("CSV出力完了", f"CSVファイルを出力しました:\n{out_path}")
+                    w.writerow([p.item_no, p.part_number, p.part_name, p.specification, p.material, p.treatment, p.formatted_qty(), p.unit, p.unit_weight, p.total_weight, p.category, p.manufacturer, p.unit_price, p.amount, p.source_file, p.remarks])
+            messagebox.showinfo("CSV出力完了", f"CSVを保存しました:\n{out_path}")
+        except PermissionError:
+            messagebox.showerror(
+                "ファイル使用中エラー",
+                f"保存先のCSVファイルが他のソフト（Excelなど）で開かれています。\n\n{out_path}\n\nファイルを閉じてから、もう一度保存してください。",
+            )
         except Exception as e:
-            messagebox.showerror("CSV出力エラー", f"CSV保存中にエラーが発生しました:\n{e}")
+            messagebox.showerror("CSVエラー", str(e))
 
     def action_save_project(self) -> None:
-        out_path = filedialog.asksaveasfilename(
-            title="プロジェクトファイルの保存",
-            defaultextension=".plens.json",
-            initialfile=f"{self.dwg_no_var.get().strip() or 'Project'}.plens.json",
-            filetypes=[("PartLens プロジェクト (*.plens.json;*.json)", "*.plens.json *.json")],
-        )
+        out_path = filedialog.asksaveasfilename(title="プロジェクト保存", defaultextension=".plens.json", initialfile="Project.plens.json", filetypes=[("PartLens Project (*.plens.json)", "*.plens.json")])
         if not out_path:
             return
-
         data = {
             "app_name": APP_NAME,
-            "saved_at": datetime.datetime.now().isoformat(),
             "project_name": self.proj_name_var.get(),
             "drawing_no": self.dwg_no_var.get(),
             "author_name": self.author_var.get(),
@@ -3915,63 +4417,46 @@ class PartLensApp:
         try:
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            self.set_status(f"プロジェクトを保存しました: {out_path}")
-            messagebox.showinfo("保存完了", f"作業状態を保存しました:\n{out_path}")
+            messagebox.showinfo("保存完了", f"プロジェクトを保存しました:\n{out_path}")
         except Exception as e:
-            messagebox.showerror("保存エラー", f"プロジェクト保存中にエラーが発生しました:\n{e}")
+            messagebox.showerror("保存エラー", str(e))
 
     def action_load_project(self) -> None:
-        in_path = filedialog.askopenfilename(
-            title="プロジェクトファイルを開く",
-            filetypes=[("PartLens プロジェクト (*.plens.json;*.json)", "*.plens.json *.json")],
-        )
+        in_path = filedialog.askopenfilename(title="プロジェクト読込", filetypes=[("PartLens Project (*.plens.json;*.json)", "*.plens.json *.json")])
         if not in_path:
             return
-
         try:
             with open(in_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
+                d = json.load(f)
             self._push_undo_state()
-            self.proj_name_var.set(str(data.get("project_name", "")))
-            self.dwg_no_var.set(str(data.get("drawing_no", "")))
-            self.author_var.set(str(data.get("author_name", "")))
-
-            loaded_parts = [PartItem.from_dict(d) for d in data.get("parts", [])]
-            self.parts = loaded_parts
-
-            # 元図面ファイルが存在すればプレビュー用に再読込
+            self.proj_name_var.set(str(d.get("project_name", "")))
+            self.dwg_no_var.set(str(d.get("drawing_no", "")))
+            self.author_var.set(str(d.get("author_name", "")))
+            self.parts = [PartItem.from_dict(x) for x in d.get("parts", [])]
             self.documents.clear()
-            for fpath in data.get("source_files", []):
-                if os.path.exists(fpath):
+            for fp in d.get("source_files", []):
+                if os.path.exists(fp):
                     try:
-                        doc_model, _ = DrawingParserEngine.parse_file(fpath)
-                        self.documents.append(doc_model)
+                        dm, _ = DrawingParserEngine.parse_file(fp)
+                        self.documents.append(dm)
                     except Exception:
                         pass
-
             self._refresh_document_listbox()
             if self.documents:
                 self.current_doc_idx = 0
-                self.current_page_idx = 0
                 self._fit_canvas_view()
             self._refresh_treeview()
-            self.set_status(f"プロジェクトを読み込みました ({len(self.parts)} 件の部品データ)。")
         except Exception as e:
-            messagebox.showerror("読込エラー", f"プロジェクトの読み込みに失敗しました:\n{e}")
+            messagebox.showerror("読込エラー", str(e))
 
     def action_show_readme(self) -> None:
         ReadmeViewerDialog(self.root)
 
 
-# ==============================================================================
-# エントリーポイント
-# ==============================================================================
-
 def main() -> None:
     enable_high_dpi_awareness()
     root = tk.Tk()
-    app = PartLensApp(root)
+    PartLensApp(root)
     root.mainloop()
 
 

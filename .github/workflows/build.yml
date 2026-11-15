@@ -41,6 +41,7 @@ jobs:
         --hidden-import PIL.Image 
         --hidden-import PIL.ImageTk 
         --hidden-import PIL.ImageDraw 
+        --hidden-import google.genai 
         --collect-all pymupdf 
         --collect-all ezdxf 
         app.py
